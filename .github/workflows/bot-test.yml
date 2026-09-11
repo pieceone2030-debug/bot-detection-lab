@@ -28,3 +28,12 @@ jobs:
         env:
           TARGET_URL: https://pog01.blogspot.com/
         run: npm test
+
+      - name: Upload screenshot and HTML
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: blogger-test-evidence
+          path: screenshots/
+          if-no-files-found: warn
+          retention-days: 7
