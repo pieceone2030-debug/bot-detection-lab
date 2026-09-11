@@ -1,0 +1,30 @@
+name: Bot Detection Lab
+
+on:
+  workflow_dispatch:
+
+jobs:
+  browser-test:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Install npm packages
+        run: npm install
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser test
+        env:
+          TARGET_URL: https://pog01.blogspot.com/
+        run: npm test
