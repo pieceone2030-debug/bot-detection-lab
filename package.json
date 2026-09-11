@@ -6,6 +6,9 @@
     "test": "node bot-test.js"
   },
   "dependencies": {
-    "playwright": "^1.55.0"
+    "patchright": "^1.62.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "@zorilla/puppeteer-extra-plugin-anonymize-ua": "^2.0.1"
   }
 }
