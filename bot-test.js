@@ -6,7 +6,7 @@ const path = require("path");
 // استيراد الإضافات المساعدة
 const { addExtra } = require("playwright-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-const AnonymizeUA = require("@zorilla/puppeteer-extra-plugin-anonymize-ua");
+const AnonymizeUA = require("@zorilla/puppeteer-extra-plugin-anonymize-ua").default;
 
 // دمج الإضافات مع patchright
 const chromiumExtra = addExtra(chromium);
