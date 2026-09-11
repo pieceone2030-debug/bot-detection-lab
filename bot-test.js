@@ -36,7 +36,8 @@ async function main() {
             '--no-first-run',
             '--no-zygote',
             '--disable-gpu'
-        ],
+        ]
+        });
         // استخدام بروكسي سكني (استبدل هذه القيم ببياناتك)
        
 
