@@ -1,12 +1,13 @@
 const { chromium } = require("playwright");
 
-const TARGET_URL = process.env.TARGET_URL;
+const TARGET_URL =
+    process.env.TARGET_URL ||
+    "https://pog01.blogspot.com/";
 
 async function main() {
-    if (!TARGET_URL) {
-        throw new Error("TARGET_URL is missing");
-    }
-
+    console.log("=================================");
+    console.log("BLOGGER BOT DETECTION LAB");
+    console.log("=================================");
     console.log("Target:", TARGET_URL);
 
     const browser = await chromium.launch({
@@ -22,15 +23,26 @@ async function main() {
 
     const page = await context.newPage();
 
-    const start = Date.now();
+    const requests = [];
+    const responses = [];
 
-    page.on("requestfailed", request => {
-        console.log(
-            "REQUEST_FAILED:",
-            request.url(),
-            request.failure()?.errorText || ""
-        );
+    page.on("request", request => {
+        requests.push({
+            method: request.method(),
+            url: request.url(),
+            resourceType: request.resourceType()
+        });
     });
+
+    page.on("response", response => {
+        responses.push({
+            status: response.status(),
+            url: response.url(),
+            resourceType: response.request().resourceType()
+        });
+    });
+
+    const start = Date.now();
 
     try {
         const response = await page.goto(
@@ -41,13 +53,20 @@ async function main() {
             }
         );
 
+        console.log("\n--- NAVIGATION ---");
+
         console.log(
-            "HTTP status:",
-            response?.status() ?? "unknown"
+            "Initial HTTP status:",
+            response ? response.status() : "NONE"
         );
 
         console.log(
-            "Initial URL:",
+            "Initial response URL:",
+            response ? response.url() : "NONE"
+        );
+
+        console.log(
+            "Current page URL:",
             page.url()
         );
 
@@ -56,9 +75,52 @@ async function main() {
             await page.title()
         );
 
-        // نعطي Blogger والـJavaScript 12 ثانية
-        // لتسجيل جلسة الاختبار.
-        await page.waitForTimeout(12000);
+        console.log(
+            "Elapsed:",
+            Date.now() - start,
+            "ms"
+        );
+
+        const finalUrl = page.url();
+
+        const isGoogleSorry =
+            finalUrl.includes("google.com/sorry");
+
+        const isBlogger =
+            finalUrl.includes("blogspot.com");
+
+        console.log("\n--- CLASSIFICATION ---");
+
+        if (isGoogleSorry) {
+            console.log("RESULT: GOOGLE_SORRY");
+        } else if (isBlogger) {
+            console.log("RESULT: BLOGGER_REACHED");
+        } else {
+            console.log("RESULT: OTHER");
+        }
+
+        console.log("\n--- RESPONSE SUMMARY ---");
+
+        const relevant =
+            responses
+                .filter(r =>
+                    r.status >= 400 ||
+                    r.url.includes("blogspot.com") ||
+                    r.url.includes("google.com/sorry")
+                )
+                .slice(-20);
+
+        for (const r of relevant) {
+            console.log(
+                r.status,
+                r.resourceType,
+                r.url
+            );
+        }
+
+        console.log("\n--- WAITING ---");
+
+        await page.waitForTimeout(10000);
 
         console.log(
             "Final URL:",
@@ -66,16 +128,26 @@ async function main() {
         );
 
         console.log(
-            "Elapsed ms:",
-            Date.now() - start
+            "Total requests:",
+            requests.length
         );
 
+        console.log(
+            "Total responses:",
+            responses.length
+        );
+
+    } catch (error) {
+
+        console.error("\nTEST ERROR:");
+        console.error(error);
+
+        process.exitCode = 1;
+
     } finally {
+
         await browser.close();
     }
 }
 
-main().catch(error => {
-    console.error(error);
-    process.exit(1);
-});
+main();
