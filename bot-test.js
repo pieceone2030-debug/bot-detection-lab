@@ -38,12 +38,7 @@ async function main() {
             '--disable-gpu'
         ],
         // استخدام بروكسي سكني (استبدل هذه القيم ببياناتك)
-        proxy: {
-            server: 'http://your-residential-proxy.com:port',
-            username: 'your_username',
-            password: 'your_password'
-        }
-    });
+       
 
     const context = await browser.newContext({
         // تعيين بصمة متسقة (User-Agent, locale, timezone)
