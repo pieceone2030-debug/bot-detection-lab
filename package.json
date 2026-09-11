@@ -1,0 +1,11 @@
+{
+  "name": "bot-detection-lab",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node bot-test.js"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}
