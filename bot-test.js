@@ -1,4 +1,6 @@
 const { chromium } = require("playwright");
+const fs = require("fs");
+const path = require("path");
 
 const TARGET_URL =
     process.env.TARGET_URL ||
@@ -81,13 +83,11 @@ async function main() {
             "ms"
         );
 
-        const finalUrl = page.url();
-
         const isGoogleSorry =
-            finalUrl.includes("google.com/sorry");
+            page.url().includes("google.com/sorry");
 
         const isBlogger =
-            finalUrl.includes("blogspot.com");
+            page.url().includes("blogspot.com");
 
         console.log("\n--- CLASSIFICATION ---");
 
@@ -118,9 +118,64 @@ async function main() {
             );
         }
 
-        console.log("\n--- WAITING ---");
+        /*
+         * انتظر حتى يعمل JavaScript في Blogger
+         */
+        console.log("\n--- WAITING 12 SECONDS ---");
 
-        await page.waitForTimeout(10000);
+        await page.waitForTimeout(12000);
+
+        /*
+         * إنشاء مجلد screenshots
+         */
+        const screenshotDir =
+            path.join(process.cwd(), "screenshots");
+
+        fs.mkdirSync(
+            screenshotDir,
+            { recursive: true }
+        );
+
+        /*
+         * لقطة شاشة كاملة للصفحة
+         */
+        const screenshotPath =
+            path.join(
+                screenshotDir,
+                "blogger-test.png"
+            );
+
+        await page.screenshot({
+            path: screenshotPath,
+            fullPage: true
+        });
+
+        console.log(
+            "\nScreenshot saved:",
+            screenshotPath
+        );
+
+        /*
+         * حفظ HTML أيضًا للمقارنة لاحقًا
+         */
+        const htmlPath =
+            path.join(
+                screenshotDir,
+                "blogger-page.html"
+            );
+
+        fs.writeFileSync(
+            htmlPath,
+            await page.content(),
+            "utf8"
+        );
+
+        console.log(
+            "HTML saved:",
+            htmlPath
+        );
+
+        console.log("\n--- FINAL STATE ---");
 
         console.log(
             "Final URL:",
@@ -137,10 +192,52 @@ async function main() {
             responses.length
         );
 
+        console.log(
+            "Elapsed ms:",
+            Date.now() - start
+        );
+
     } catch (error) {
 
         console.error("\nTEST ERROR:");
         console.error(error);
+
+        /*
+         * إذا حدث خطأ أثناء التنقل،
+         * نحاول أخذ screenshot للحالة الحالية.
+         */
+        try {
+
+            const screenshotDir =
+                path.join(
+                    process.cwd(),
+                    "screenshots"
+                );
+
+            fs.mkdirSync(
+                screenshotDir,
+                { recursive: true }
+            );
+
+            await page.screenshot({
+                path: path.join(
+                    screenshotDir,
+                    "error-state.png"
+                ),
+                fullPage: true
+            });
+
+            console.log(
+                "Error screenshot saved."
+            );
+
+        } catch (screenError) {
+
+            console.error(
+                "Could not save error screenshot:",
+                screenError
+            );
+        }
 
         process.exitCode = 1;
 
