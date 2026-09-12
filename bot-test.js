@@ -11,12 +11,14 @@ chromiumExtra.use(AnonymizeUA());
 
 const TARGET_URL = process.env.TARGET_URL || "https://pog01.blogspot.com/";
 
+/* ⚠️ مهم: نستخدم نفس البصمة في كل مكان */
+const FAKE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
 /* ============================================================
    أدوات عامة
    ============================================================ */
 
-let mouseX = 700;
-let mouseY = 400;
+let mouseX = 700, mouseY = 400;
 
 function rand(a, b) { return a + Math.random() * (b - a); }
 function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
@@ -95,11 +97,10 @@ async function clickAt(page, x, y) {
 }
 
 /* ============================================================
-   استخراج عناصر الألعاب — 3 طبقات احتياطية
+   بطاقات الألعاب — 3 طبقات
    ============================================================ */
 
-/* الطبقة 1: صور داخل <a> برابط /YYYY/MM/ */
-async function findGameCards_V1(page) {
+async function findCards_V1(page) {
     return await page.evaluate(() => {
         const out = [];
         document.querySelectorAll('img').forEach(img => {
@@ -113,23 +114,14 @@ async function findGameCards_V1(page) {
             out.push({ href, x: r.x, y: r.y, w: r.width, h: r.height });
         });
         const seen = new Set();
-        return out.filter(o => {
-            if (seen.has(o.href)) return false;
-            seen.add(o.href);
-            return true;
-        });
+        return out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
     });
 }
 
-/* الطبقة 2: أي <a> داخل منطقة المحتوى برابط /YYYY/MM/ */
-async function findGameCards_V2(page) {
+async function findCards_V2(page) {
     return await page.evaluate(() => {
-        const scope =
-            document.querySelector('.post-body') ||
-            document.querySelector('#main') ||
-            document.querySelector('.main') ||
-            document.querySelector('#content') ||
-            document.body;
+        const scope = document.querySelector('.post-body') || document.querySelector('#main') ||
+                      document.querySelector('.main') || document.querySelector('#content') || document.body;
         const out = [];
         scope.querySelectorAll('a[href]').forEach(a => {
             const href = a.href || '';
@@ -140,16 +132,11 @@ async function findGameCards_V2(page) {
             out.push({ href, x: r.x, y: r.y, w: r.width, h: r.height });
         });
         const seen = new Set();
-        return out.filter(o => {
-            if (seen.has(o.href)) return false;
-            seen.add(o.href);
-            return true;
-        });
+        return out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
     });
 }
 
-/* الطبقة 3: أي <a> برابط blogspot فيه أرقام سنة (نمط أوسع) */
-async function findGameCards_V3(page) {
+async function findCards_V3(page) {
     return await page.evaluate(() => {
         const out = [];
         document.querySelectorAll('a[href]').forEach(a => {
@@ -162,85 +149,83 @@ async function findGameCards_V3(page) {
             out.push({ href, x: r.x, y: r.y, w: r.width, h: r.height });
         });
         const seen = new Set();
-        return out.filter(o => {
-            if (seen.has(o.href)) return false;
-            seen.add(o.href);
-            return true;
-        });
+        return out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
     });
 }
 
-async function findAllGameCards(page) {
-    let cards = await findGameCards_V1(page);
-    log(`     V1 (img inside /YYYY/MM/ link): ${cards.length}`);
-    if (cards.length >= 3) return cards;
-
-    cards = await findGameCards_V2(page);
-    log(`     V2 (any /YYYY/MM/ link in content): ${cards.length}`);
-    if (cards.length >= 3) return cards;
-
-    cards = await findGameCards_V3(page);
-    log(`     V3 (any /YYYY/ link on page): ${cards.length}`);
-    return cards;
+async function findAllCards(page) {
+    let c = await findCards_V1(page);
+    log(`     V1: ${c.length}`);
+    if (c.length >= 3) return c;
+    c = await findCards_V2(page);
+    log(`     V2: ${c.length}`);
+    if (c.length >= 3) return c;
+    c = await findCards_V3(page);
+    log(`     V3: ${c.length}`);
+    return c;
 }
 
 async function scrollToHref(page, href) {
-    await page.evaluate((h) => {
-        for (const l of document.querySelectorAll('a[href]')) {
-            if (l.href === h) {
-                l.scrollIntoView({ behavior: 'instant', block: 'center' });
-                return;
+    try {
+        await page.evaluate((h) => {
+            for (const l of document.querySelectorAll('a[href]')) {
+                if (l.href === h) { l.scrollIntoView({ behavior: 'instant', block: 'center' }); return; }
             }
-        }
-    }, href);
-    await pause(page, 300, 700);
+        }, href);
+        await pause(page, 300, 700);
+    } catch (e) {
+        log(`     ! scrollToHref skipped: ${e.message.substring(0, 60)}`);
+    }
 }
 
 async function boxOfHref(page, href) {
-    return await page.evaluate((h) => {
-        for (const l of document.querySelectorAll('a[href]')) {
-            if (l.href === h) {
-                const r = l.getBoundingClientRect();
-                return { x: r.x, y: r.y, w: r.width, h: r.height };
+    try {
+        return await page.evaluate((h) => {
+            for (const l of document.querySelectorAll('a[href]')) {
+                if (l.href === h) {
+                    const r = l.getBoundingClientRect();
+                    return { x: r.x, y: r.y, w: r.width, h: r.height };
+                }
             }
-        }
+            return null;
+        }, href);
+    } catch (e) {
         return null;
-    }, href);
+    }
 }
 
-/* الرابط الخارجي لموقع اللعبة */
 async function findExternalLink(page) {
-    return await page.evaluate(() => {
-        const EXCL = ['blogspot.com','blogger.com','google.com','googlesyndication',
-            'doubleclick','googleadservices','google-analytics','gstatic',
-            'googleusercontent','facebook.com','fb.com','twitter.com','x.com',
-            'instagram.com','youtube.com','youtu.be','whatsapp','telegram',
-            't.me','pinterest','tiktok','linkedin','reddit.com','blogger.googleusercontent'];
-        const bad = h => EXCL.some(d => h.toLowerCase().includes(d));
-        const scope = document.querySelector('.post-body')
-            || document.querySelector('.entry-content')
-            || document.querySelector('article')
-            || document.body;
-        const candidates = [];
-        for (const a of scope.querySelectorAll('a[href^="http"]')) {
-            const href = a.href;
-            if (bad(href)) continue;
-            const text = (a.textContent || '').trim();
-            if (text.length < 3) continue;
-            const s = getComputedStyle(a);
-            if (s.display === 'none' || s.visibility === 'hidden') continue;
-            const r = a.getBoundingClientRect();
-            if (r.width < 30 || r.height < 12) continue;
-            candidates.push({ href, text, x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height });
-        }
-        // الأكبر مساحةً هو الأرجح أن يكون زر "العب الآن"
-        candidates.sort((a, b) => b.area - a.area);
-        return candidates[0] || null;
-    });
+    try {
+        return await page.evaluate(() => {
+            const EXCL = ['blogspot.com','blogger.com','google.com','googlesyndication',
+                'doubleclick','googleadservices','google-analytics','gstatic','googleusercontent',
+                'facebook.com','fb.com','twitter.com','x.com','instagram.com','youtube.com',
+                'youtu.be','whatsapp','telegram','t.me','pinterest','tiktok','linkedin','reddit.com'];
+            const bad = h => EXCL.some(d => h.toLowerCase().includes(d));
+            const scope = document.querySelector('.post-body') || document.querySelector('.entry-content') ||
+                          document.querySelector('article') || document.body;
+            const c = [];
+            for (const a of scope.querySelectorAll('a[href^="http"]')) {
+                const href = a.href;
+                if (bad(href)) continue;
+                const text = (a.textContent || '').trim();
+                if (text.length < 3) continue;
+                const s = getComputedStyle(a);
+                if (s.display === 'none' || s.visibility === 'hidden') continue;
+                const r = a.getBoundingClientRect();
+                if (r.width < 30 || r.height < 12) continue;
+                c.push({ href, text, x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height });
+            }
+            c.sort((a, b) => b.area - a.area);
+            return c[0] || null;
+        });
+    } catch (e) {
+        return null;
+    }
 }
 
 /* ============================================================
-   السلوك
+   الإجراءات
    ============================================================ */
 
 async function clickGame(page, href) {
@@ -248,37 +233,61 @@ async function clickGame(page, href) {
     await scrollToHref(page, href);
     const box = await boxOfHref(page, href);
     if (!box || box.w < 30) { log("     ! box not found"); return false; }
+
     const cx = box.x + box.w * rand(0.3, 0.7);
     const cy = box.y + box.h * rand(0.3, 0.7);
+
     if (Math.random() < 0.7) {
         await moveMouse(page, cx, cy);
         await pause(page, 120, 400);
     }
-    await clickAt(page, cx, cy);
-    try { await page.waitForLoadState('domcontentloaded', { timeout: 10000 }); } catch (e) {}
+
+    try {
+        // ننتظر التنقل + النقر معاً
+        await Promise.all([
+            page.waitForURL(/\/\d{4}\/\d{2}\//, { timeout: 15000 }).catch(() => {}),
+            clickAt(page, cx, cy)
+        ]);
+        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    } catch (e) {
+        log(`     ! click error: ${e.message.substring(0, 60)}`);
+    }
+
     if (/\/\d{4}\/\d{2}\//.test(page.url())) {
-        log(`     ✓ on post page: ${page.url().substring(0, 70)}...`);
+        log(`     ✓ on post: ${page.url().substring(0, 70)}...`);
         return true;
     }
-    log(`     ! not on post page (url: ${page.url().substring(0, 70)})`);
+    log(`     ! not on post (url: ${page.url().substring(0, 70)})`);
     return false;
 }
 
-async function readPost(page) {
-    log("     Reading post...");
-    const rounds = randInt(2, 3);
-    for (let i = 0; i < rounds; i++) {
-        await scrollDown(page, randInt(150, 380));
-        await pause(page, 400, 1200);
-        await microMoves(page, randInt(1, 2));
+/* ⚡ قراءة المقال لمدة لا تقل عن minSeconds — ينتظر الكاشف أن يرسل بنفسه */
+async function dwellOnPost(page, minSeconds) {
+    log(`     Reading post for >=${minSeconds}s...`);
+    const startTime = Date.now();
+    const targetMs = minSeconds * 1000;
+
+    while (Date.now() - startTime < targetMs) {
+        const action = Math.random();
+        if (action < 0.4) {
+            await scrollDown(page, randInt(150, 350));
+            await pause(page, 500, 1200);
+        } else if (action < 0.6) {
+            await scrollUp(page, randInt(100, 220));
+            await pause(page, 400, 900);
+        } else {
+            await microMoves(page, randInt(1, 3));
+            await pause(page, 400, 1000);
+        }
     }
+    log(`     Reading done (${Math.round((Date.now() - startTime) / 1000)}s)`);
 }
 
 async function exitToGame(page) {
     log("     Looking for external game link...");
     const link = await findExternalLink(page);
-    if (!link) { log("     ! no external link found"); return false; }
-    log(`     Found: "${link.text}" -> ${link.href.substring(0, 60)}...`);
+    if (!link) { log("     ! no external link"); return false; }
+    log(`     Found: "${link.text}" -> ${link.href.substring(0, 55)}...`);
 
     await scrollToHref(page, link.href);
     const box = await boxOfHref(page, link.href);
@@ -286,88 +295,90 @@ async function exitToGame(page) {
 
     const cx = box.x + box.w * rand(0.35, 0.65);
     const cy = box.y + box.h * rand(0.35, 0.65);
+
     if (Math.random() < 0.6) {
         await moveMouse(page, cx, cy);
         await pause(page, 200, 500);
     }
-    await clickAt(page, cx, cy);
 
-    try { await page.waitForLoadState('domcontentloaded', { timeout: 14000 }); } catch (e) {}
+    try {
+        await Promise.all([
+            page.waitForURL(u => !u.toString().includes('blogspot.com'), { timeout: 15000 }).catch(() => {}),
+            clickAt(page, cx, cy)
+        ]);
+        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    } catch (e) {}
+
     await pause(page, 1200, 2400);
 
     if (!page.url().includes('blogspot.com')) {
-        log(`     ✓ LEFT BLOG -> ${page.url().substring(0, 60)}...`);
+        log(`     ✓ LEFT -> ${page.url().substring(0, 60)}...`);
         await pause(page, 700, 1400);
         await microMoves(page, 2);
         await scrollDown(page, randInt(150, 350));
-        await pause(page, 700, 1400);
+        await pause(page, 1000, 2000);
         return true;
     }
-    log(`     ! still on blog: ${page.url().substring(0, 70)}`);
+    log(`     ! still on blog`);
     return false;
 }
 
 /* ============================================================
-   الجلسة البشرية
+   الجلسة
    ============================================================ */
 
 async function runSession(page) {
     log("\n===== HUMAN SESSION =====");
 
-    // 1) حركة أولية فورية — قبل أي شيء
-    log("  Initial mouse activity...");
+    // حركة أولية
     await microMoves(page, 2);
     await pause(page, 150, 350);
 
-    // 2) مسح سريع للرئيسية (لا يستهلك وقتاً طويلاً)
-    log("  Quick homepage scan...");
+    // مسح سريع
     await scrollDown(page, randInt(200, 380));
     await pause(page, 250, 550);
     await microMoves(page, 1);
 
-    // 3) ابحث عن بطاقات الألعاب — 3 طبقات
+    // إيجاد البطاقات
     log("  Searching for game cards...");
-    const cards = await findAllGameCards(page);
-    log(`  Total cards found: ${cards.length}`);
+    let cards = await findAllCards(page);
+    log(`  Total: ${cards.length}`);
 
     if (cards.length === 0) {
-        log("  ! No game cards — trying scroll further...");
+        log("  Retrying after scroll...");
         await scrollDown(page, 500);
         await pause(page, 500, 1000);
-        const more = await findAllGameCards(page);
-        log(`  Retry cards found: ${more.length}`);
-        if (more.length === 0) {
-            log("  ! ABORT: no game cards at all");
-            await microMoves(page, 3);
-            return;
-        }
-        return await continueSession(page, more);
+        cards = await findAllCards(page);
+        log(`  Retry total: ${cards.length}`);
+        if (cards.length === 0) { log("  ABORT"); return; }
     }
 
-    return await continueSession(page, cards);
-}
-
-async function continueSession(page, cards) {
     const r = Math.random();
     const plan = r < 0.6 ? 'single-exit' : (r < 0.85 ? 'single-return' : 'double');
     log(`  Plan: ${plan}`);
 
+    // النقرة الأولى
     const first = weightedPick(cards);
     const ok1 = await clickGame(page, first.href);
 
     if (!ok1) {
-        log("  First game click failed, trying another...");
-        const alt = weightedPick(cards.filter(c => c.href !== first.href));
-        if (alt) await clickGame(page, alt.href);
+        await pause(page, 800, 1500);
+        if (/\/\d{4}\/\d{2}\//.test(page.url())) {
+            log("  (Already navigated)");
+        } else {
+            const alt = weightedPick(cards.filter(c => c.href !== first.href));
+            if (alt) await clickGame(page, alt.href);
+        }
     }
 
+    // على صفحة المقال — اقرأ >= 13 ثانية ثم اخرج
     if (/\/\d{4}\/\d{2}\//.test(page.url())) {
-        await readPost(page);
+        await dwellOnPost(page, 13);
 
         if (plan === 'single-exit' || plan === 'double') {
             const left = await exitToGame(page);
             if (!left && plan === 'single-exit') {
-                log("  Falling back to return");
+                log("  Fallback to return");
                 try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
                 await pause(page, 700, 1400);
             }
@@ -378,21 +389,20 @@ async function continueSession(page, cards) {
         }
     }
 
+    // لعبة ثانية (نموذج المستكشف)
     if (plan === 'double' && page.url().includes('blogspot.com') && !/\/\d{4}\/\d{2}\//.test(page.url())) {
         await pause(page, 500, 1200);
         await scrollDown(page, randInt(150, 320));
         await pause(page, 400, 900);
-        const fresh = await findAllGameCards(page);
+        const fresh = await findAllCards(page);
         const remaining = fresh.filter(c => c.href !== first.href);
         if (remaining.length) {
             const second = weightedPick(remaining);
             const ok2 = await clickGame(page, second.href);
             if (ok2) {
-                await readPost(page);
+                await dwellOnPost(page, 13);
                 const left = await exitToGame(page);
-                if (!left) {
-                    try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
-                }
+                if (!left) { try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {} }
             }
         }
     }
@@ -413,6 +423,7 @@ async function main() {
     const browser = await chromiumExtra.launch({
         headless: true,
         args: [
+            `--user-agent=${FAKE_UA}`,
             '--disable-blink-features=AutomationControlled',
             '--no-sandbox', '--disable-setuid-sandbox',
             '--disable-dev-shm-usage', '--no-first-run', '--no-zygote'
@@ -422,18 +433,39 @@ async function main() {
     const context = await browser.newContext({
         viewport: { width: 1920, height: 1080 },
         screen: { width: 1920, height: 1080 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        userAgent: FAKE_UA,
         locale: 'en-US',
         timezoneId: 'America/New_York',
         deviceScaleFactor: 1
     });
+
+    /* 🔒 إصلاح User-Agent بشكل قاطع — يُنفَّذ قبل أي سكربت في الصفحة */
+    await context.addInitScript(({ ua }) => {
+        try {
+            Object.defineProperty(navigator, 'userAgent', { get: () => ua, configurable: true });
+            Object.defineProperty(navigator, 'appVersion', { get: () => ua.replace('Mozilla/', ''), configurable: true });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+            Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.', configurable: true });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+            // plugins مصطنعة
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [
+                    { name: 'Chrome PDF Plugin' },
+                    { name: 'Chrome PDF Viewer' },
+                    { name: 'Native Client' }
+                ],
+                configurable: true
+            });
+            Object.defineProperty(navigator, 'mimeTypes', { get: () => [], configurable: true });
+        } catch (e) {}
+    }, { ua: FAKE_UA });
 
     const page = await context.newPage();
     const requests = [], responses = [];
     page.on("request", r => requests.push(r.url()));
     page.on("response", r => responses.push({ s: r.status(), u: r.url() }));
 
-    // سجل كل navigation لفهم ما يحدث
     page.on("framenavigated", f => {
         if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 90)}`);
     });
@@ -441,10 +473,7 @@ async function main() {
     const start = Date.now();
 
     try {
-        const response = await page.goto(TARGET_URL, {
-            waitUntil: "domcontentloaded",
-            timeout: 60000
-        });
+        const response = await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
 
         console.log("\n--- NAVIGATION ---");
         console.log("HTTP:", response ? response.status() : "NONE");
@@ -452,13 +481,11 @@ async function main() {
         console.log("Title:", await page.title());
         console.log("Elapsed:", Date.now() - start, "ms");
 
-        await runSession(page);
+        // تحقق سريع من UA
+        const liveUA = await page.evaluate(() => navigator.userAgent);
+        console.log("Live UA:", liveUA);
 
-        console.log("\n--- CLASSIFICATION ---");
-        const u = page.url();
-        if (u.includes("google.com/sorry")) console.log("RESULT: GOOGLE_SORRY");
-        else if (u.includes("blogspot.com")) console.log("RESULT: STILL_ON_BLOG");
-        else console.log("RESULT: LEFT_TO_EXTERNAL (realistic exit)");
+        await runSession(page);
 
         console.log("\n--- FINAL ---");
         console.log("Final URL:", page.url());
@@ -469,10 +496,9 @@ async function main() {
         fs.mkdirSync(dir, { recursive: true });
         await page.screenshot({ path: path.join(dir, "blogger-test.png"), fullPage: true });
         fs.writeFileSync(path.join(dir, "blogger-page.html"), await page.content(), "utf8");
-        console.log("Screenshot + HTML saved.");
+        console.log("Saved screenshot + HTML.");
 
-        // انتظر حتى الكاشف يرسل بياناته على pagehide
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(2500);
 
     } catch (error) {
         console.error("TEST ERROR:", error);
