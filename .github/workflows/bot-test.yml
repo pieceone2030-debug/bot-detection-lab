@@ -2,36 +2,52 @@ name: Bot Detection Lab
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Bot mode'
+        required: true
+        default: 'mixed'
+        type: choice
+        options:
+          - single
+          - parallel
+          - sequential
+          - mixed
+      count:
+        description: 'Number of bots'
+        required: true
+        default: '3'
+        type: string
 
 jobs:
   browser-test:
-
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
           node-version: '24'
 
       - name: Install npm packages
         run: npm install
 
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
+      - name: Install Patchright Chromium
+        run: npx patchright install --with-deps chromium
 
       - name: Run browser test
         env:
           TARGET_URL: https://pog01.blogspot.com/
+          BOT_MODE: ${{ github.event.inputs.mode }}
+          BOT_COUNT: ${{ github.event.inputs.count }}
         run: npm test
 
-      - name: Upload screenshot and HTML
+      - name: Upload screenshots
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: blogger-test-evidence
           path: screenshots/
