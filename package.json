@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "test": "node bot-test.js"
+    "test": "node bot-test.js",
+    "test:parallel": "BOT_MODE=parallel BOT_COUNT=3 node bot-test.js",
+    "test:sequential": "BOT_MODE=sequential BOT_COUNT=4 node bot-test.js",
+    "test:mixed": "BOT_MODE=mixed BOT_COUNT=5 node bot-test.js"
   },
   "dependencies": {
     "patchright": "^1.62.1",
