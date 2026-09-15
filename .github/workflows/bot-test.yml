@@ -1,34 +1,45 @@
-name: Bot Detection Lab
+name: Bot Detection Lab — Anti-Cluster
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Bot mode'
+        description: 'Run mode'
         required: true
-        default: 'mixed'
+        default: 'matrix'
         type: choice
         options:
-          - single
-          - parallel
-          - sequential
-          - mixed
-      count:
-        description: 'Number of bots'
+          - matrix         # ← الأفضل ضد الكشف الجماعي (runner منفصل لكل بوت)
+          - distributed    # بوتات متعددة في runner واحد + بروكسيات + توزيع زمني
+          - single         # بوت واحد
+      bot_count:
+        description: 'Number of bots (for distributed)'
         required: true
-        default: '3'
+        default: '8'
+        type: string
+      window_minutes:
+        description: 'Time window in minutes (for distributed)'
+        required: true
+        default: '30'
         type: string
 
 jobs:
-  browser-test:
+  # ========================================================
+  # وضع MATRIX — كل بوت على runner منفصل (IP مختلف)
+  # ========================================================
+  matrix-run:
+    if: ${{ github.event.inputs.mode == 'matrix' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3      # ← مهم: لا تشغّل كل البوتات في نفس اللحظة
+      matrix:
+        bot_id: [1, 2, 3, 4, 5, 6, 7, 8]
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '24'
 
@@ -38,18 +49,90 @@ jobs:
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      - name: Run browser test
+      - name: Random initial delay (avoid synchronized launch)
+        run: |
+          DELAY=$((RANDOM % 180))
+          echo "Sleeping ${DELAY}s before bot #${{ matrix.bot_id }}..."
+          sleep $DELAY
+
+      - name: Run bot ${{ matrix.bot_id }}
         env:
           TARGET_URL: https://pog01.blogspot.com/
-          BOT_MODE: ${{ github.event.inputs.mode }}
-          BOT_COUNT: ${{ github.event.inputs.count }}
+          BOT_MODE: matrix
+          BOT_ID: ${{ matrix.bot_id }}
+        run: npm test
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-${{ matrix.bot_id }}-evidence
+          path: screenshots/
+          if-no-files-found: warn
+          retention-days: 3
+
+  # ========================================================
+  # وضع DISTRIBUTED — بوتات متعددة في runner واحد
+  # ========================================================
+  distributed-run:
+    if: ${{ github.event.inputs.mode == 'distributed' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install npm packages
+        run: npm install
+
+      - name: Install Patchright Chromium
+        run: npx patchright install --with-deps chromium
+
+      - name: Run distributed bots
+        env:
+          TARGET_URL: https://pog01.blogspot.com/
+          BOT_MODE: distributed
+          BOT_COUNT: ${{ github.event.inputs.bot_count }}
+          WINDOW_MINUTES: ${{ github.event.inputs.window_minutes }}
+          MAX_PER_IP: '2'
+          PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
         run: npm test
 
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: blogger-test-evidence
+          name: distributed-evidence
           path: screenshots/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 3
+
+  # ========================================================
+  # وضع SINGLE
+  # ========================================================
+  single-run:
+    if: ${{ github.event.inputs.mode == 'single' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install
+      - run: npx patchright install --with-deps chromium
+      - name: Run single bot
+        env:
+          TARGET_URL: https://pog01.blogspot.com/
+          BOT_MODE: single
+          PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
+        run: npm test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: single-evidence
+          path: screenshots/
