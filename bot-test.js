@@ -1,6 +1,16 @@
+/**
+ * Bot Detection Lab v3.0 — Anti-Cluster Edition
+ * ──────────────────────────────────────────────────────────────
+ * Modes: single | parallel | sequential | distributed | campaign | auto
+ * Cron-safe: uses .bot-state/state.json to avoid overlaps and repeats
+ * ──────────────────────────────────────────────────────────────
+ */
+'use strict';
+
 const { chromium } = require("patchright");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { addExtra } = require("playwright-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const AnonymizeUA = require("@zorilla/puppeteer-extra-plugin-anonymize-ua").default;
@@ -9,16 +19,84 @@ const chromiumExtra = addExtra(chromium);
 chromiumExtra.use(StealthPlugin());
 chromiumExtra.use(AnonymizeUA());
 
-const TARGET_URL = process.env.TARGET_URL || "https://pog01.blogspot.com/";
-const BOT_MODE = process.env.BOT_MODE || "single";
-const BOT_COUNT = parseInt(process.env.BOT_COUNT || "1", 10);
-const BOT_ID = process.env.BOT_ID || "1";           // يُستخدم في matrix mode
-const WINDOW_MINUTES = parseInt(process.env.WINDOW_MINUTES || "30", 10);
-const MAX_PER_IP = parseInt(process.env.MAX_PER_IP || "2", 10);
+/* ═══════════════════════════════════════════════════════════════
+   ⚙️  الإعدادات — كل شيء قابل للتحكم عبر متغيرات البيئة
+   ═══════════════════════════════════════════════════════════════ */
 
-/* ============================================================
-   🎨 مخزون البصمات الأساسية (دون locale/timezone)
-   ============================================================ */
+const CFG = {
+    targetUrl:        process.env.TARGET_URL        || "https://pog01.blogspot.com/",
+    mode:             process.env.BOT_MODE          || "single",
+    botCount:         intEnv("BOT_COUNT",           3),
+    botId:            process.env.BOT_ID            || "1",
+    parallelism:      intEnv("PARALLELISM",         3),
+    windowMinutes:    intEnv("WINDOW_MINUTES",      30),
+    minGapSec:        intEnv("MIN_GAP_SECONDS",     15),
+    maxGapSec:        intEnv("MAX_GAP_SECONDS",     90),
+    maxPerIp:         intEnv("MAX_PER_IP",          2),
+    maxDurationMin:   intEnv("MAX_DURATION_MINUTES", 55),
+    headless:         envBool("HEADLESS",           true),
+    screenshots:      envBool("SCREENSHOTS",        true),
+    saveHtml:         envBool("SAVE_HTML",          false),
+    dwellMin:         intEnv("DWELL_MIN",           12),
+    dwellMax:         intEnv("DWELL_MAX",           17),
+    stateDir:         process.env.STATE_DIR         || ".bot-state",
+    cronMinGapMin:    intEnv("CRON_MIN_GAP_MINUTES", 20),
+    timezoneStrict:   envBool("TZ_STRICT",          true),
+    randomSeed:       process.env.RANDOM_SEED       || null,
+};
+
+function intEnv(k, d) {
+    const v = process.env[k];
+    if (v === undefined || v === "") return d;
+    const n = parseInt(v, 10);
+    return isNaN(n) ? d : n;
+}
+function envBool(k, d) {
+    const v = process.env[k];
+    if (v === undefined) return d;
+    return /^(1|true|yes|on)$/i.test(v);
+}
+
+const RUN_ID = process.env.RUN_ID || crypto.randomBytes(4).toString('hex');
+const START_TS = Date.now();
+
+/* ═══════════════════════════════════════════════════════════════
+   📝  Logger
+   ═══════════════════════════════════════════════════════════════ */
+
+function ts() {
+    const d = new Date();
+    return d.toISOString().substring(11, 19);
+}
+const LOG = {
+    info:  (id, m) => console.log(`[${ts()}] [${id}] ${m}`),
+    warn:  (id, m) => console.warn(`[${ts()}] [${id}] ⚠️  ${m}`),
+    error: (id, m) => console.error(`[${ts()}] [${id}] ❌ ${m}`),
+    ok:    (id, m) => console.log(`[${ts()}] [${id}] ✅ ${m}`),
+};
+
+/* ═══════════════════════════════════════════════════════════════
+   🎲  Random utilities (deterministic if seed provided)
+   ═══════════════════════════════════════════════════════════════ */
+
+let rng = Math.random;
+if (CFG.randomSeed) {
+    const seed = parseInt(CFG.randomSeed, 36) || 1;
+    let s = seed >>> 0;
+    rng = () => {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        return s / 0xFFFFFFFF;
+    };
+}
+
+const rand    = (a, b) => a + rng() * (b - a);
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
+const pick    = arr => arr[Math.floor(rng() * arr.length)];
+const sleep   = ms => new Promise(r => setTimeout(r, ms));
+
+/* ═══════════════════════════════════════════════════════════════
+   🧬  Fingerprint database
+   ═══════════════════════════════════════════════════════════════ */
 
 const BASE_FINGERPRINTS = [
     {
@@ -70,37 +148,87 @@ const BASE_FINGERPRINTS = [
         gpuVendor: "Google Inc. (AMD)",
         gpuRenderer: "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)",
         cores: 6, memory: 8, colorDepth: 24, dsf: 1
+    },
+    {
+        name: "Win-NVIDIA-GTX1650",
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        platform: "Win32",
+        viewport: { width: 1360, height: 768 },
+        screen: { width: 1360, height: 768, availHeight: 728 },
+        gpuVendor: "Google Inc. (NVIDIA)",
+        gpuRenderer: "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        cores: 8, memory: 16, colorDepth: 24, dsf: 1
+    },
+    {
+        name: "Mac-Intel-Iris",
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        platform: "MacIntel",
+        viewport: { width: 1680, height: 1050 },
+        screen: { width: 1680, height: 1050, availHeight: 1000 },
+        gpuVendor: "Google Inc. (Intel)",
+        gpuRenderer: "ANGLE (Intel, Intel(R) Iris(TM) Plus Graphics 640, OpenGL 4.1)",
+        cores: 4, memory: 8, colorDepth: 30, dsf: 2
+    },
+    {
+        name: "Win-AMD-Vega",
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        platform: "Win32",
+        viewport: { width: 1600, height: 900 },
+        screen: { width: 1600, height: 900, availHeight: 860 },
+        gpuVendor: "Google Inc. (AMD)",
+        gpuRenderer: "ANGLE (AMD, AMD Radeon(TM) Vega 8 Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        cores: 8, memory: 8, colorDepth: 24, dsf: 1
     }
 ];
 
-/* ============================================================
-   🌍 خريطة الدولة → locale + timezones
-   ============================================================ */
+/* ═══════════════════════════════════════════════════════════════
+   🌍  Geo profiles
+   ═══════════════════════════════════════════════════════════════ */
 
 const GEO_PROFILES = {
-    'US': { locale: 'en-US', languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'] },
+    'US': { locale: 'en-US', languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix'] },
+    'CA': { locale: 'en-CA', languages: ['en-CA', 'en', 'fr'], timezones: ['America/Toronto', 'America/Vancouver'] },
     'GB': { locale: 'en-GB', languages: ['en-GB', 'en'], timezones: ['Europe/London'] },
     'DE': { locale: 'de-DE', languages: ['de-DE', 'de', 'en'], timezones: ['Europe/Berlin'] },
     'FR': { locale: 'fr-FR', languages: ['fr-FR', 'fr', 'en'], timezones: ['Europe/Paris'] },
-    'CA': { locale: 'en-CA', languages: ['en-CA', 'en', 'fr'], timezones: ['America/Toronto', 'America/Vancouver'] },
-    'AU': { locale: 'en-AU', languages: ['en-AU', 'en'], timezones: ['Australia/Sydney', 'Australia/Melbourne'] },
     'NL': { locale: 'nl-NL', languages: ['nl-NL', 'nl', 'en'], timezones: ['Europe/Amsterdam'] },
-    'JP': { locale: 'ja-JP', languages: ['ja-JP', 'ja'], timezones: ['Asia/Tokyo'] },
-    'IN': { locale: 'en-IN', languages: ['en-IN', 'en', 'hi'], timezones: ['Asia/Kolkata'] },
-    'BR': { locale: 'pt-BR', languages: ['pt-BR', 'pt', 'en'], timezones: ['America/Sao_Paulo'] },
-    'SA': { locale: 'ar-SA', languages: ['ar-SA', 'ar', 'en'], timezones: ['Asia/Riyadh'] },
-    'AE': { locale: 'ar-AE', languages: ['ar-AE', 'ar', 'en'], timezones: ['Asia/Dubai'] },
-    'SG': { locale: 'en-SG', languages: ['en-SG', 'en'], timezones: ['Asia/Singapore'] },
     'ES': { locale: 'es-ES', languages: ['es-ES', 'es', 'en'], timezones: ['Europe/Madrid'] },
     'IT': { locale: 'it-IT', languages: ['it-IT', 'it', 'en'], timezones: ['Europe/Rome'] },
     'PL': { locale: 'pl-PL', languages: ['pl-PL', 'pl', 'en'], timezones: ['Europe/Warsaw'] },
+    'AU': { locale: 'en-AU', languages: ['en-AU', 'en'], timezones: ['Australia/Sydney', 'Australia/Melbourne'] },
+    'JP': { locale: 'ja-JP', languages: ['ja-JP', 'ja'], timezones: ['Asia/Tokyo'] },
     'KR': { locale: 'ko-KR', languages: ['ko-KR', 'ko', 'en'], timezones: ['Asia/Seoul'] },
+    'IN': { locale: 'en-IN', languages: ['en-IN', 'en', 'hi'], timezones: ['Asia/Kolkata'] },
+    'SG': { locale: 'en-SG', languages: ['en-SG', 'en'], timezones: ['Asia/Singapore'] },
+    'BR': { locale: 'pt-BR', languages: ['pt-BR', 'pt', 'en'], timezones: ['America/Sao_Paulo'] },
     'MX': { locale: 'es-MX', languages: ['es-MX', 'es', 'en'], timezones: ['America/Mexico_City'] },
     'AR': { locale: 'es-AR', languages: ['es-AR', 'es', 'en'], timezones: ['America/Argentina/Buenos_Aires'] },
     'ZA': { locale: 'en-ZA', languages: ['en-ZA', 'en'], timezones: ['Africa/Johannesburg'] },
+    'SA': { locale: 'ar-SA', languages: ['ar-SA', 'ar', 'en'], timezones: ['Asia/Riyadh'] },
+    'AE': { locale: 'ar-AE', languages: ['ar-AE', 'ar', 'en'], timezones: ['Asia/Dubai'] },
     'TR': { locale: 'tr-TR', languages: ['tr-TR', 'tr', 'en'], timezones: ['Europe/Istanbul'] },
     'ID': { locale: 'id-ID', languages: ['id-ID', 'id', 'en'], timezones: ['Asia/Jakarta'] },
-    'TH': { locale: 'th-TH', languages: ['th-TH', 'th', 'en'], timezones: ['Asia/Bangkok'] }
+    'TH': { locale: 'th-TH', languages: ['th-TH', 'th', 'en'], timezones: ['Asia/Bangkok'] },
+    'PH': { locale: 'en-PH', languages: ['en-PH', 'en', 'fil'], timezones: ['Asia/Manila'] },
+    'VN': { locale: 'vi-VN', languages: ['vi-VN', 'vi', 'en'], timezones: ['Asia/Ho_Chi_Minh'] },
+    'EG': { locale: 'ar-EG', languages: ['ar-EG', 'ar', 'en'], timezones: ['Africa/Cairo'] },
+    'RU': { locale: 'ru-RU', languages: ['ru-RU', 'ru', 'en'], timezones: ['Europe/Moscow'] },
+    'UA': { locale: 'uk-UA', languages: ['uk-UA', 'uk', 'ru', 'en'], timezones: ['Europe/Kiev'] }
+};
+
+const TZ_OFFSETS = {
+    'America/New_York': 300, 'America/Chicago': 360, 'America/Denver': 420,
+    'America/Phoenix': 420, 'America/Los_Angeles': 480, 'America/Toronto': 300,
+    'America/Vancouver': 480, 'America/Mexico_City': 360, 'America/Sao_Paulo': 180,
+    'America/Argentina/Buenos_Aires': 180,
+    'Europe/London': 0, 'Europe/Berlin': -60, 'Europe/Paris': -60, 'Europe/Madrid': -60,
+    'Europe/Rome': -60, 'Europe/Warsaw': -60, 'Europe/Amsterdam': -60,
+    'Europe/Moscow': -180, 'Europe/Istanbul': -180, 'Europe/Kiev': -120,
+    'Asia/Riyadh': -180, 'Asia/Dubai': -240, 'Asia/Kolkata': -330, 'Asia/Jakarta': -420,
+    'Asia/Bangkok': -420, 'Asia/Singapore': -480, 'Asia/Tokyo': -540, 'Asia/Seoul': -540,
+    'Asia/Manila': -480, 'Asia/Ho_Chi_Minh': -420,
+    'Australia/Sydney': -600, 'Australia/Melbourne': -600,
+    'Africa/Johannesburg': -120, 'Africa/Cairo': -120
 };
 
 function pickGeoProfile(countryCode) {
@@ -108,35 +236,33 @@ function pickGeoProfile(countryCode) {
     return GEO_PROFILES[key] || GEO_PROFILES['US'];
 }
 
-/* ============================================================
-   🌐 إدارة مجموعة البروكسيات
-   ============================================================ */
+/* ═══════════════════════════════════════════════════════════════
+   🌐  Proxy pool
+   ═══════════════════════════════════════════════════════════════ */
 
 class ProxyPool {
     constructor(list) {
-        this.proxies = list.map(p => ({ ...p, usage: 0, lastUsed: 0, geo: null, failed: 0 }));
+        this.proxies = list.map(p => ({
+            ...p,
+            usage: 0,
+            lastUsed: 0,
+            failed: 0,
+            geo: null
+        }));
     }
 
     static fromEnv() {
-        // 1) PROXIES_JSON = '[{"server":"1.2.3.4:8080","username":"u","password":"p"}]'
         if (process.env.PROXIES_JSON) {
             try {
-                const arr = JSON.parse(process.env.PROXIES_JSON);
-                return new ProxyPool(arr);
-            } catch (e) {
-                console.error('PROXIES_JSON parse error:', e.message);
-            }
+                return new ProxyPool(JSON.parse(process.env.PROXIES_JSON));
+            } catch (e) { console.error('PROXIES_JSON parse error:', e.message); }
         }
-        // 2) PROXIES = 'host1:port1:user1:pass1\nhost2:port2' (multi-line)
         if (process.env.PROXIES) {
-            const list = parseProxyLines(process.env.PROXIES);
-            return new ProxyPool(list);
+            return new ProxyPool(parseProxyLines(process.env.PROXIES));
         }
-        // 3) proxies.txt
         const file = path.join(process.cwd(), 'proxies.txt');
         if (fs.existsSync(file)) {
-            const list = parseProxyLines(fs.readFileSync(file, 'utf8'));
-            return new ProxyPool(list);
+            return new ProxyPool(parseProxyLines(fs.readFileSync(file, 'utf8')));
         }
         return new ProxyPool([]);
     }
@@ -144,19 +270,37 @@ class ProxyPool {
     size() { return this.proxies.length; }
     isEmpty() { return this.proxies.length === 0; }
 
-    pickLeastUsed() {
+    pickLeastUsed(maxPerIp = CFG.maxPerIp) {
         if (this.isEmpty()) return null;
-        const sorted = [...this.proxies].sort((a, b) => {
-            if (a.failed >= 3) return 1;
-            if (b.failed >= 3) return -1;
+        const ipCount = new Map();
+        for (const p of this.proxies) {
+            const ip = p.server.split(':')[0];
+            ipCount.set(ip, (ipCount.get(ip) || 0) + p.usage);
+        }
+        const candidates = this.proxies.filter(p => {
+            if (p.failed >= 3) return false;
+            const ip = p.server.split(':')[0];
+            return (ipCount.get(ip) || 0) < maxPerIp;
+        });
+        if (candidates.length === 0) return null;
+        candidates.sort((a, b) => {
             if (a.usage !== b.usage) return a.usage - b.usage;
             return a.lastUsed - b.lastUsed;
         });
-        return sorted[0];
+        return candidates[0];
     }
 
     markUsed(p) { if (p) { p.usage++; p.lastUsed = Date.now(); } }
     markFailed(p) { if (p) p.failed++; }
+
+    toJSON() {
+        return this.proxies.map(p => ({
+            server: p.server,
+            usage: p.usage,
+            failed: p.failed,
+            lastUsed: p.lastUsed
+        }));
+    }
 }
 
 function parseProxyLines(text) {
@@ -170,27 +314,31 @@ function parseProxyLines(text) {
     }).filter(Boolean);
 }
 
-/* ============================================================
-   🌍 تحديد موقع البروكسي تلقائياً (IP + timezone)
-   ============================================================ */
+/* ═══════════════════════════════════════════════════════════════
+   🌍  Geo detection (uses a temp browser)
+   ═══════════════════════════════════════════════════════════════ */
 
-async function detectProxyGeo(browser, proxy) {
-    // نفتح متصفح مؤقت لفحص الـ IP
-    const ctx = await browser.newContext({
-        proxy: proxy ? {
-            server: `http://${proxy.server}`,
-            username: proxy.username,
-            password: proxy.password
-        } : undefined,
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    });
-    const page = await ctx.newPage();
+async function detectGeo(proxy) {
+    let browser;
     try {
+        const opts = { headless: true };
+        if (proxy) {
+            opts.proxy = {
+                server: `http://${proxy.server}`,
+                username: proxy.username,
+                password: proxy.password
+            };
+        }
+        browser = await chromiumExtra.launch(opts);
+        const ctx = await browser.newContext({
+            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            proxy: opts.proxy
+        });
+        const page = await ctx.newPage();
         await page.goto('https://ipapi.co/json/', { waitUntil: 'domcontentloaded', timeout: 15000 });
         const data = await page.evaluate(() => {
             try { return JSON.parse(document.body.innerText); } catch (e) { return null; }
         });
-        await ctx.close();
         if (!data) return null;
         return {
             ip: data.ip,
@@ -202,14 +350,15 @@ async function detectProxyGeo(browser, proxy) {
             asn: data.asn
         };
     } catch (e) {
-        await ctx.close().catch(() => {});
         return null;
+    } finally {
+        if (browser) await browser.close().catch(() => {});
     }
 }
 
-/* ============================================================
-   🧬 بناء بصمة متوافقة مع موقع IP
-   ============================================================ */
+/* ═══════════════════════════════════════════════════════════════
+   🧬  Build geo-matched fingerprint
+   ═══════════════════════════════════════════════════════════════ */
 
 function buildFingerprintForGeo(baseFp, geo) {
     const fp = JSON.parse(JSON.stringify(baseFp));
@@ -218,35 +367,30 @@ function buildFingerprintForGeo(baseFp, geo) {
     fp.locale = profile.locale;
     fp.languages = [...profile.languages];
 
-    // نستخدم timezone IP إن وُجد، وإلا نختار من قائمة الدولة
-    if (geo && geo.timezone) {
+    if (geo && geo.timezone && TZ_OFFSETS[geo.timezone] !== undefined) {
         fp.timezone = geo.timezone;
     } else {
-        fp.timezone = profile.timezones[Math.floor(Math.random() * profile.timezones.length)];
+        fp.timezone = pick(profile.timezones);
     }
 
-    // بعض التعديلات الصغيرة على البصمة (لكل بوت على نفس الـIP)
-    // حتى تبدو أجهزة مختلفة على نفس الشبكة
-    const variation = Math.random();
-    if (variation < 0.3) {
-        // نفس البصمة
-    } else if (variation < 0.6) {
-        // تصغير viewport
-        fp.viewport.width = Math.round(fp.viewport.width * 0.9);
-        fp.viewport.height = Math.round(fp.viewport.height * 0.9);
-    } else if (variation < 0.8) {
-        // تغيير دقة الشاشة قليلاً
-        fp.screen.availHeight = fp.screen.height - 30 - Math.floor(Math.random() * 30);
-    } else {
-        // نفس البصمة بدون تغيير
+    // subtle variations so two bots on the same proxy aren't identical
+    const v = rng();
+    if (v < 0.25) {
+        fp.viewport.width  = Math.round(fp.viewport.width  * 0.92);
+        fp.viewport.height = Math.round(fp.viewport.height * 0.92);
+    } else if (v < 0.5) {
+        fp.screen.availHeight = fp.screen.height - randInt(20, 60);
+    } else if (v < 0.7) {
+        const baseUA = fp.userAgent.replace(/Chrome\/\d+/, `Chrome/${randInt(120, 133)}`);
+        fp.userAgent = baseUA;
     }
-
+    // 30% no change
     return fp;
 }
 
-/* ============================================================
-   🛡️ سكربت التخفي (نفس السابق، مُحسَّن)
-   ============================================================ */
+/* ═══════════════════════════════════════════════════════════════
+   🛡️  Stealth init script
+   ═══════════════════════════════════════════════════════════════ */
 
 function buildStealthScript(fp) {
     return `
@@ -254,6 +398,7 @@ function buildStealthScript(fp) {
         'use strict';
         const FP = ${JSON.stringify(fp)};
         const navProto = Navigator.prototype;
+
         try {
             Object.defineProperty(navProto, 'userAgent', { get: () => FP.userAgent, configurable: true });
             Object.defineProperty(navProto, 'appVersion', { get: () => FP.userAgent.replace('Mozilla/', ''), configurable: true });
@@ -266,33 +411,34 @@ function buildStealthScript(fp) {
             Object.defineProperty(navProto, 'maxTouchPoints', { get: () => 0, configurable: true });
             Object.defineProperty(navProto, 'webdriver', { get: () => undefined, configurable: true });
         } catch (e) {}
+
         try {
-            function mkPlugin(name, filename, desc, mimes) {
-                const p = Object.create(Plugin.prototype);
-                Object.defineProperty(p, 'name', { value: name });
-                Object.defineProperty(p, 'filename', { value: filename });
-                Object.defineProperty(p, 'description', { value: desc });
-                Object.defineProperty(p, 'length', { value: mimes.length });
-                mimes.forEach((m, i) => Object.defineProperty(p, i, { value: m }));
-                return p;
-            }
-            function mkMime(type, suffixes, desc) {
+            const makeMime = (type, suffixes, desc) => {
                 const m = Object.create(MimeType.prototype);
                 Object.defineProperty(m, 'type', { value: type });
                 Object.defineProperty(m, 'suffixes', { value: suffixes });
                 Object.defineProperty(m, 'description', { value: desc });
                 Object.defineProperty(m, 'enabledPlugin', { value: null });
                 return m;
-            }
-            const pdf1 = mkMime('application/pdf', 'pdf', 'Portable Document Format');
-            const pdf2 = mkMime('text/pdf', 'pdf', 'Portable Document Format');
+            };
+            const makePlugin = (name, file, desc, mimes) => {
+                const p = Object.create(Plugin.prototype);
+                Object.defineProperty(p, 'name', { value: name });
+                Object.defineProperty(p, 'filename', { value: file });
+                Object.defineProperty(p, 'description', { value: desc });
+                Object.defineProperty(p, 'length', { value: mimes.length });
+                mimes.forEach((m, i) => Object.defineProperty(p, i, { value: m }));
+                return p;
+            };
+            const pdf1 = makeMime('application/pdf', 'pdf', 'Portable Document Format');
+            const pdf2 = makeMime('text/pdf', 'pdf', 'Portable Document Format');
             const plugins = [
-                mkPlugin('PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                mkPlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                mkPlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                mkPlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                mkPlugin('WebKit built-in PDF', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                mkPlugin('Native Client', 'internal-nacl-plugin', '', [])
+                makePlugin('PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                makePlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                makePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                makePlugin('WebKit built-in PDF', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                makePlugin('Native Client', 'internal-nacl-plugin', '', [])
             ];
             const arr = Object.create(PluginArray.prototype);
             plugins.forEach((p, i) => Object.defineProperty(arr, i, { value: p }));
@@ -301,6 +447,7 @@ function buildStealthScript(fp) {
             Object.defineProperty(arr, 'namedItem', { value: n => plugins.find(p => p.name === n) || null });
             Object.defineProperty(navProto, 'plugins', { get: () => arr, configurable: true });
         } catch (e) {}
+
         try {
             const sp = Screen.prototype;
             Object.defineProperty(sp, 'width', { get: () => FP.screen.width });
@@ -310,6 +457,7 @@ function buildStealthScript(fp) {
             Object.defineProperty(sp, 'colorDepth', { get: () => FP.colorDepth });
             Object.defineProperty(sp, 'pixelDepth', { get: () => FP.colorDepth });
         } catch (e) {}
+
         try {
             const gp = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function (p) {
@@ -330,6 +478,7 @@ function buildStealthScript(fp) {
                 };
             }
         } catch (e) {}
+
         try {
             const origResolved = Intl.DateTimeFormat.prototype.resolvedOptions;
             Intl.DateTimeFormat.prototype.resolvedOptions = function () {
@@ -337,20 +486,12 @@ function buildStealthScript(fp) {
                 if (r.timeZone) r.timeZone = FP.timezone;
                 return r;
             };
-            const tzMap = {
-                'America/New_York': 300, 'America/Chicago': 360, 'America/Denver': 420,
-                'America/Los_Angeles': 480, 'Europe/London': 0, 'Europe/Berlin': -60,
-                'Europe/Paris': -60, 'Asia/Riyadh': -180, 'Asia/Dubai': -240,
-                'Asia/Tokyo': -540, 'Asia/Kolkata': -330, 'Asia/Singapore': -480,
-                'Australia/Sydney': -600, 'America/Sao_Paulo': 180, 'Asia/Seoul': -540,
-                'America/Toronto': 300, 'America/Vancouver': 480, 'Asia/Jakarta': -420,
-                'Asia/Bangkok': -420, 'Europe/Madrid': -60, 'Europe/Rome': -60,
-                'Europe/Warsaw': -60, 'Europe/Amsterdam': -60, 'Africa/Johannesburg': -120,
-                'Europe/Istanbul': -180, 'America/Mexico_City': 360,
-                'America/Argentina/Buenos_Aires': 180
+            const offset = ${JSON.stringify(TZ_OFFSETS)};
+            Date.prototype.getTimezoneOffset = function () {
+                return offset[FP.timezone] !== undefined ? offset[FP.timezone] : 0;
             };
-            Date.prototype.getTimezoneOffset = function () { return tzMap[FP.timezone] !== undefined ? tzMap[FP.timezone] : 0; };
         } catch (e) {}
+
         try {
             if (navigator.permissions && navigator.permissions.query) {
                 const oq = navigator.permissions.query.bind(navigator.permissions);
@@ -360,13 +501,15 @@ function buildStealthScript(fp) {
                 };
             }
         } catch (e) {}
+
         try {
             window.chrome = window.chrome || {};
             window.chrome.runtime = window.chrome.runtime || {};
             window.chrome.app = window.chrome.app || { isInstalled: false };
-            window.chrome.csi = function () { return { onloadT: Date.now(), startE: Date.now(), pageT: 0, tran: 15 }; };
-            window.chrome.loadTimes = function () { return { commitLoadTime: Date.now() / 1000, finishLoadTime: Date.now() / 1000, navigationType: 'Other' }; };
+            window.chrome.csi = () => ({ onloadT: Date.now(), startE: Date.now(), pageT: 0, tran: 15 });
+            window.chrome.loadTimes = () => ({ commitLoadTime: Date.now()/1000, finishLoadTime: Date.now()/1000, navigationType: 'Other' });
         } catch (e) {}
+
         try {
             const oRTC = window.RTCPeerConnection;
             window.RTCPeerConnection = function (cfg) {
@@ -378,283 +521,226 @@ function buildStealthScript(fp) {
     `;
 }
 
-/* ============================================================
-   🎭 جلسة بوت واحد
-   ============================================================ */
+/* ═══════════════════════════════════════════════════════════════
+   🎭  Behavior engine
+   ═══════════════════════════════════════════════════════════════ */
 
-async function runOneBot(botId, fingerprint, options = {}) {
-    const { proxy = null, proxyGeo = null } = options;
-    const log = (m) => console.log(`[BOT-${botId}] ${m}`);
-    const tag = `BOT-${botId}`;
+function makeBehaviorEngine(log) {
+    let mouseX = randInt(300, 1200);
+    let mouseY = randInt(200, 800);
 
-    log(`Fingerprint: ${fingerprint.name}`);
-    log(`  UA: ${fingerprint.userAgent.substring(0, 70)}...`);
-    log(`  TZ: ${fingerprint.timezone} | Locale: ${fingerprint.locale}`);
-    log(`  GPU: ${fingerprint.gpuRenderer.substring(0, 60)}...`);
-    if (proxy) log(`  Proxy: ${proxy.server} | Geo: ${proxyGeo ? proxyGeo.city + ',' + proxyGeo.country : '?'}`);
-
-    let mouseX = Math.floor(300 + Math.random() * 800);
-    let mouseY = Math.floor(200 + Math.random() * 500);
-
-    const pause = (page, a, b) => page.waitForTimeout(Math.floor(a + Math.random() * (b - a)));
+    const pause = (page, a, b) => page.waitForTimeout(randInt(a, b));
 
     async function moveMouse(page, tx, ty) {
         const sx = mouseX, sy = mouseY;
         const dist = Math.hypot(tx - sx, ty - sy);
         if (dist < 2) return;
-        const cX = (sx + tx) / 2 + (Math.random() - 0.5) * Math.min(dist * 0.4, 150);
-        const cY = (sy + ty) / 2 + (Math.random() - 0.5) * Math.min(dist * 0.4, 150);
-        const steps = Math.max(5, Math.min(35, Math.round(dist / 15) + Math.floor(2 + Math.random() * 6)));
+        const cX = (sx + tx) / 2 + (rng() - 0.5) * Math.min(dist * 0.4, 150);
+        const cY = (sy + ty) / 2 + (rng() - 0.5) * Math.min(dist * 0.4, 150);
+        const steps = Math.max(5, Math.min(35, Math.round(dist / 15) + randInt(2, 6)));
         for (let i = 1; i <= steps; i++) {
             const t = i / steps;
             const x = (1 - t) * (1 - t) * sx + 2 * (1 - t) * t * cX + t * t * tx;
             const y = (1 - t) * (1 - t) * sy + 2 * (1 - t) * t * cY + t * t * ty;
-            await page.mouse.move(x + (Math.random() - 0.5) * 2, y + (Math.random() - 0.5) * 2);
-            await page.waitForTimeout(Math.floor(4 + Math.random() * 12));
+            await page.mouse.move(x + (rng() - 0.5) * 2, y + (rng() - 0.5) * 2);
+            await page.waitForTimeout(randInt(4, 16));
         }
         mouseX = tx; mouseY = ty;
     }
 
     async function scrollDown(page, dy) {
-        const chunks = 3 + Math.floor(Math.random() * 4);
+        const chunks = randInt(3, 6);
         for (let i = 0; i < chunks; i++) {
-            await page.mouse.wheel(0, dy / chunks + (Math.random() - 0.5) * 30);
-            await page.waitForTimeout(Math.floor(35 + Math.random() * 75));
+            await page.mouse.wheel(0, dy / chunks + (rng() - 0.5) * 30);
+            await page.waitForTimeout(randInt(35, 110));
         }
     }
 
     async function scrollUp(page, dy) {
-        const chunks = 2 + Math.floor(Math.random() * 3);
+        const chunks = randInt(2, 4);
         for (let i = 0; i < chunks; i++) {
-            await page.mouse.wheel(0, -dy / chunks + (Math.random() - 0.5) * 20);
-            await page.waitForTimeout(Math.floor(45 + Math.random() * 75));
+            await page.mouse.wheel(0, -dy / chunks + (rng() - 0.5) * 20);
+            await page.waitForTimeout(randInt(45, 120));
         }
     }
 
     async function microMoves(page, n) {
         for (let i = 0; i < n; i++) {
-            await moveMouse(page, mouseX + (Math.random() - 0.5) * 60, mouseY + (Math.random() - 0.5) * 35);
+            await moveMouse(page, mouseX + (rng() - 0.5) * 60, mouseY + (rng() - 0.5) * 35);
             await pause(page, 80, 260);
         }
     }
 
     async function clickAt(page, x, y) {
         await moveMouse(page, x, y);
-        if (Math.random() < 0.35) {
-            await moveMouse(page, x + (Math.random() - 0.5) * 28, y + (Math.random() - 0.5) * 28);
+        if (rng() < 0.35) {
+            await moveMouse(page, x + (rng() - 0.5) * 28, y + (rng() - 0.5) * 28);
             await pause(page, 100, 300);
             await moveMouse(page, x, y);
         }
         await pause(page, 50, 180);
-        await page.mouse.move(x + (Math.random() - 0.5) * 2, y + (Math.random() - 0.5) * 2);
+        await page.mouse.move(x + (rng() - 0.5) * 2, y + (rng() - 0.5) * 2);
         await pause(page, 30, 90);
         await page.mouse.down();
-        await page.waitForTimeout(Math.floor(45 + Math.random() * 60));
+        await page.waitForTimeout(randInt(45, 105));
         await page.mouse.up();
     }
 
-    async function findCards(page) {
-        let cards = await page.evaluate(() => {
-            const out = [];
-            document.querySelectorAll('img').forEach(img => {
-                const a = img.closest('a');
-                if (!a) return;
-                const href = a.href || '';
-                if (!href.includes('blogspot.com')) return;
-                if (!/\/\d{4}\/\d{2}\//.test(href)) return;
-                const r = img.getBoundingClientRect();
-                if (r.width < 60 || r.height < 60) return;
-                out.push({ href, x: r.x, y: r.y, w: r.width, h: r.height });
-            });
-            const s = new Set();
-            return out.filter(o => { if (s.has(o.href)) return false; s.add(o.href); return true; });
-        }).catch(() => []);
-        if (cards.length >= 3) return cards;
-        cards = await page.evaluate(() => {
-            const out = [];
-            document.querySelectorAll('a[href]').forEach(a => {
-                const href = a.href || '';
-                if (!href.includes('blogspot.com')) return;
-                if (!/\/\d{4}\//.test(href)) return;
-                const r = a.getBoundingClientRect();
-                if (r.width < 80 || r.height < 80 || r.width > 900) return;
-                out.push({ href, x: r.x, y: r.y, w: r.width, h: r.height });
-            });
-            const s = new Set();
-            return out.filter(o => { if (s.has(o.href)) return false; s.add(o.href); return true; });
-        }).catch(() => []);
-        return cards;
-    }
+    return { moveMouse, scrollDown, scrollUp, microMoves, clickAt, pause };
+}
 
-    async function scrollToHref(page, href) {
-        try {
-            await page.evaluate((h) => {
-                for (const l of document.querySelectorAll('a[href]')) {
-                    if (l.href === h) { l.scrollIntoView({ behavior: 'instant', block: 'center' }); return; }
-                }
-            }, href);
-            await pause(page, 300, 700);
-        } catch (e) {}
-    }
+/* ═══════════════════════════════════════════════════════════════
+   🔎  Page analysis helpers
+   ═══════════════════════════════════════════════════════════════ */
 
-    async function boxOfHref(page, href) {
-        try {
-            return await page.evaluate((h) => {
-                for (const l of document.querySelectorAll('a[href]')) {
-                    if (l.href === h) {
-                        const r = l.getBoundingClientRect();
-                        return { x: r.x, y: r.y, w: r.width, h: r.height };
-                    }
-                }
-                return null;
-            }, href);
-        } catch (e) { return null; }
-    }
+async function findCards(page) {
+    let cards = await page.evaluate(() => {
+        const out = [];
+        document.querySelectorAll('img').forEach(img => {
+            const a = img.closest('a');
+            if (!a) return;
+            const href = a.href || '';
+            if (!href.includes('blogspot.com')) return;
+            if (!/\/\d{4}\/\d{2}\//.test(href)) return;
+            const r = img.getBoundingClientRect();
+            if (r.width < 60 || r.height < 60) return;
+            out.push({ href, x: r.x, y: r.y, w: r.width, h: r.height });
+        });
+        const s = new Set();
+        return out.filter(o => { if (s.has(o.href)) return false; s.add(o.href); return true; });
+    }).catch(() => []);
 
-    async function findExternalLink(page) {
-        try {
-            return await page.evaluate(() => {
-                const EXCL = ['blogspot.com','blogger.com','google.com','googlesyndication',
-                    'doubleclick','googleadservices','google-analytics','gstatic','googleusercontent',
-                    'facebook.com','fb.com','twitter.com','x.com','instagram.com','youtube.com',
-                    'youtu.be','whatsapp','telegram','t.me','pinterest','tiktok','linkedin','reddit.com'];
-                const bad = h => EXCL.some(d => h.toLowerCase().includes(d));
-                const scope = document.querySelector('.post-body') || document.querySelector('.entry-content') ||
-                              document.querySelector('article') || document.body;
-                const c = [];
-                for (const a of scope.querySelectorAll('a[href^="http"]')) {
-                    const href = a.href;
-                    if (bad(href)) continue;
-                    const text = (a.textContent || '').trim();
-                    if (text.length < 3) continue;
-                    const s = getComputedStyle(a);
-                    if (s.display === 'none' || s.visibility === 'hidden') continue;
-                    const r = a.getBoundingClientRect();
-                    if (r.width < 30 || r.height < 12) continue;
-                    c.push({ href, text, x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height });
-                }
-                c.sort((a, b) => b.area - a.area);
-                return c[0] || null;
-            });
-        } catch (e) { return null; }
-    }
+    if (cards.length >= 3) return cards;
 
-    async function clickGame(page, href) {
-        log(`  -> Clicking: ${href.substring(0, 70)}...`);
-        await scrollToHref(page, href);
-        const box = await boxOfHref(page, href);
-        if (!box || box.w < 30) { log("     ! box not found"); return false; }
-        const cx = box.x + box.w * (0.3 + Math.random() * 0.4);
-        const cy = box.y + box.h * (0.3 + Math.random() * 0.4);
-        if (Math.random() < 0.7) {
-            await moveMouse(page, cx, cy);
-            await pause(page, 120, 400);
-        }
-        try {
-            await Promise.all([
-                page.waitForURL(/\/\d{4}\/\d{2}\//, { timeout: 15000 }).catch(() => {}),
-                clickAt(page, cx, cy)
-            ]);
-            await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-        } catch (e) {
-            log(`     ! click error: ${e.message.substring(0, 60)}`);
-        }
-        if (/\/\d{4}\/\d{2}\//.test(page.url())) {
-            log(`     ✓ on post: ${page.url().substring(0, 70)}...`);
-            return true;
-        }
-        log(`     ! not on post`);
-        return false;
-    }
+    cards = await page.evaluate(() => {
+        const out = [];
+        document.querySelectorAll('a[href]').forEach(a => {
+            const href = a.href || '';
+            if (!href.includes('blogspot.com')) return;
+            if (!/\/\d{4}\//.test(href)) return;
+            const r = a.getBoundingClientRect();
+            if (r.width < 80 || r.height < 80 || r.width > 900) return;
+            out.push({ href, x: r.x, y: r.y, w: r.width, h: r.height });
+        });
+        const s = new Set();
+        return out.filter(o => { if (s.has(o.href)) return false; s.add(o.href); return true; });
+    }).catch(() => []);
 
-    async function dwellOnPost(page, minSeconds) {
-        log(`     Reading for >=${minSeconds}s...`);
-        const startT = Date.now();
-        while (Date.now() - startT < minSeconds * 1000) {
-            const r = Math.random();
-            if (r < 0.4) { await scrollDown(page, 150 + Math.random() * 200); await pause(page, 500, 1200); }
-            else if (r < 0.6) { await scrollUp(page, 100 + Math.random() * 120); await pause(page, 400, 900); }
-            else { await microMoves(page, 1 + Math.floor(Math.random() * 3)); await pause(page, 400, 1000); }
-        }
-        log(`     Done (${Math.round((Date.now() - startT) / 1000)}s)`);
-    }
+    return cards;
+}
 
-    async function exitToGame(page) {
-        log("     Looking for external link...");
-        const link = await findExternalLink(page);
-        if (!link) { log("     ! no external link"); return false; }
-        log(`     Found: "${link.text.substring(0, 40)}"`);
-        await scrollToHref(page, link.href);
-        const box = await boxOfHref(page, link.href);
-        if (!box || box.w < 20) return false;
-        const cx = box.x + box.w * (0.35 + Math.random() * 0.3);
-        const cy = box.y + box.h * (0.35 + Math.random() * 0.3);
-        if (Math.random() < 0.6) {
-            await moveMouse(page, cx, cy);
-            await pause(page, 200, 500);
-        }
-        try {
-            await Promise.all([
-                page.waitForURL(u => !u.toString().includes('blogspot.com'), { timeout: 15000 }).catch(() => {}),
-                clickAt(page, cx, cy)
-            ]);
-            await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-        } catch (e) {}
-        await pause(page, 1200, 2400);
-        if (!page.url().includes('blogspot.com')) {
-            log(`     ✓ LEFT -> ${page.url().substring(0, 60)}...`);
-            await pause(page, 700, 1400);
-            await microMoves(page, 2);
-            await scrollDown(page, 150 + Math.random() * 200);
-            await pause(page, 1000, 2000);
-            return true;
-        }
-        return false;
-    }
-
-    // ===== إطلاق المتصفح =====
-    const launchArgs = [
-        `--user-agent=${fingerprint.userAgent}`,
-        `--lang=${fingerprint.languages[0]}`,
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox', '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', '--no-first-run', '--no-zygote'
-    ];
-
-    const proxyConfig = proxy ? {
-        server: `http://${proxy.server}`,
-        username: proxy.username,
-        password: proxy.password
-    } : undefined;
-
-    const browser = await chromiumExtra.launch({
-        headless: true,
-        args: launchArgs,
-        proxy: proxyConfig
-    });
-
-    const context = await browser.newContext({
-        viewport: fingerprint.viewport,
-        screen: { width: fingerprint.screen.width, height: fingerprint.screen.height },
-        userAgent: fingerprint.userAgent,
-        locale: fingerprint.locale,
-        timezoneId: fingerprint.timezone,
-        deviceScaleFactor: fingerprint.dsf,
-        colorScheme: 'light',
-        proxy: proxyConfig
-    });
-
-    await context.addInitScript(buildStealthScript(fingerprint));
-
-    const page = await context.newPage();
-    page.on("framenavigated", f => {
-        if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 80)}`);
-    });
-
-    const start = Date.now();
-
+async function scrollToHref(page, href) {
     try {
-        await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.evaluate((h) => {
+            for (const l of document.querySelectorAll('a[href]')) {
+                if (l.href === h) { l.scrollIntoView({ behavior: 'instant', block: 'center' }); return; }
+            }
+        }, href);
+    } catch (e) {}
+}
+
+async function boxOfHref(page, href) {
+    try {
+        return await page.evaluate((h) => {
+            for (const l of document.querySelectorAll('a[href]')) {
+                if (l.href === h) {
+                    const r = l.getBoundingClientRect();
+                    return { x: r.x, y: r.y, w: r.width, h: r.height };
+                }
+            }
+            return null;
+        }, href);
+    } catch (e) { return null; }
+}
+
+async function findExternalLink(page) {
+    try {
+        return await page.evaluate(() => {
+            const EXCL = ['blogspot.com','blogger.com','google.com','googlesyndication',
+                'doubleclick','googleadservices','google-analytics','gstatic','googleusercontent',
+                'facebook.com','fb.com','twitter.com','x.com','instagram.com','youtube.com',
+                'youtu.be','whatsapp','telegram','t.me','pinterest','tiktok','linkedin','reddit.com'];
+            const bad = h => EXCL.some(d => h.toLowerCase().includes(d));
+            const scope = document.querySelector('.post-body') || document.querySelector('.entry-content') ||
+                          document.querySelector('article') || document.body;
+            const c = [];
+            for (const a of scope.querySelectorAll('a[href^="http"]')) {
+                const href = a.href;
+                if (bad(href)) continue;
+                const text = (a.textContent || '').trim();
+                if (text.length < 3) continue;
+                const s = getComputedStyle(a);
+                if (s.display === 'none' || s.visibility === 'hidden') continue;
+                const r = a.getBoundingClientRect();
+                if (r.width < 30 || r.height < 12) continue;
+                c.push({ href, text, x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height });
+            }
+            c.sort((a, b) => b.area - a.area);
+            return c[0] || null;
+        });
+    } catch (e) { return null; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   🎬  Bot session
+   ═══════════════════════════════════════════════════════════════ */
+
+async function runOneBot(botId, fingerprint, options = {}) {
+    const { proxy = null, proxyGeo = null } = options;
+    const tag = `BOT-${botId}`;
+    const log = (m) => LOG.info(tag, m);
+    const ok  = (m) => LOG.ok(tag, m);
+    const err = (m) => LOG.error(tag, m);
+
+    log(`Fingerprint: ${fingerprint.name}`);
+    log(`  UA: ${fingerprint.userAgent.substring(0, 70)}...`);
+    log(`  TZ: ${fingerprint.timezone} | Locale: ${fingerprint.locale} | GPU: ${fingerprint.gpuRenderer.substring(0, 45)}...`);
+    if (proxy) log(`  Proxy: ${proxy.server} → ${proxyGeo ? proxyGeo.city + ', ' + proxyGeo.country : '?'}`);
+
+    const B = makeBehaviorEngine(log);
+    const startTime = Date.now();
+
+    let browser, context, page;
+    try {
+        const launchArgs = [
+            `--user-agent=${fingerprint.userAgent}`,
+            `--lang=${fingerprint.languages[0]}`,
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox', '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage', '--no-first-run', '--no-zygote'
+        ];
+
+        const proxyConfig = proxy ? {
+            server: `http://${proxy.server}`,
+            username: proxy.username,
+            password: proxy.password
+        } : undefined;
+
+        browser = await chromiumExtra.launch({
+            headless: CFG.headless,
+            args: launchArgs,
+            proxy: proxyConfig
+        });
+
+        context = await browser.newContext({
+            viewport: fingerprint.viewport,
+            screen: { width: fingerprint.screen.width, height: fingerprint.screen.height },
+            userAgent: fingerprint.userAgent,
+            locale: fingerprint.locale,
+            timezoneId: fingerprint.timezone,
+            deviceScaleFactor: fingerprint.dsf,
+            colorScheme: 'light',
+            proxy: proxyConfig
+        });
+
+        await context.addInitScript(buildStealthScript(fingerprint));
+
+        page = await context.newPage();
+        page.on("framenavigated", f => {
+            if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 80)}`);
+        });
+
+        await page.goto(CFG.targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
         log(`Loaded homepage`);
 
         const liveFp = await page.evaluate(() => ({
@@ -673,275 +759,497 @@ async function runOneBot(botId, fingerprint, options = {}) {
             })()
         }));
         log(`  CHECK: wd=${liveFp.wd}, plugins=${liveFp.plugins}, cores=${liveFp.cores}, tz=${liveFp.tz}, langs=${liveFp.langs}`);
-        log(`  GPU: ${liveFp.gpu}`);
 
-        await microMoves(page, 2);
-        await pause(page, 150, 350);
-        await scrollDown(page, 200 + Math.random() * 180);
-        await pause(page, 250, 550);
+        // --- Behavior ---
+        await B.microMoves(page, 2);
+        await B.pause(page, 150, 350);
+        await B.scrollDown(page, randInt(200, 380));
+        await B.pause(page, 250, 550);
 
         let cards = await findCards(page);
-        log(`  Cards: ${cards.length}`);
+        log(`  Cards found: ${cards.length}`);
         if (cards.length === 0) {
-            await scrollDown(page, 500);
-            await pause(page, 500, 1000);
+            await B.scrollDown(page, 500);
+            await B.pause(page, 500, 1000);
             cards = await findCards(page);
             log(`  Retry cards: ${cards.length}`);
         }
-        if (cards.length === 0) { log("  ABORT"); await browser.close(); return; }
+        if (cards.length === 0) {
+            log("  No cards — aborting session");
+            return { status: 'no_cards', duration: Date.now() - startTime };
+        }
 
-        const r = Math.random();
+        const r = rng();
         const plan = r < 0.6 ? 'single-exit' : (r < 0.85 ? 'single-return' : 'double');
         log(`  Plan: ${plan}`);
 
-        const first = cards[Math.floor(Math.random() * Math.min(cards.length, 6))];
-        const ok1 = await clickGame(page, first.href);
+        const first = cards[randInt(0, Math.min(cards.length - 1, 5))];
+        const ok1 = await clickGame(page, first.href, B, log);
         if (!ok1) {
-            await pause(page, 800, 1500);
+            await B.pause(page, 800, 1500);
             if (!/\/\d{4}\/\d{2}\//.test(page.url()) && cards.length > 1) {
-                await clickGame(page, cards[Math.floor(Math.random() * Math.min(cards.length, 6))].href);
+                await clickGame(page, cards[randInt(0, Math.min(cards.length - 1, 5))].href, B, log);
             }
         }
 
         if (/\/\d{4}\/\d{2}\//.test(page.url())) {
-            await dwellOnPost(page, 12 + Math.floor(Math.random() * 5));
+            await dwellOnPost(page, randInt(CFG.dwellMin, CFG.dwellMax), B, log);
             if (plan === 'single-exit' || plan === 'double') {
-                const left = await exitToGame(page);
+                const left = await exitToGame(page, B, log);
                 if (!left && plan === 'single-exit') {
                     try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
-                    await pause(page, 700, 1400);
+                    await B.pause(page, 700, 1400);
                 }
             } else {
                 log("  Returning home");
                 try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
-                await pause(page, 700, 1400);
+                await B.pause(page, 700, 1400);
             }
         }
 
         if (plan === 'double' && page.url().includes('blogspot.com') && !/\/\d{4}\/\d{2}\//.test(page.url())) {
-            await pause(page, 500, 1200);
-            await scrollDown(page, 150 + Math.random() * 170);
-            await pause(page, 400, 900);
+            await B.pause(page, 500, 1200);
+            await B.scrollDown(page, randInt(150, 320));
+            await B.pause(page, 400, 900);
             const fresh = await findCards(page);
             if (fresh.length > 1) {
-                const second = fresh[Math.floor(Math.random() * Math.min(fresh.length, 6))];
-                if (await clickGame(page, second.href)) {
-                    await dwellOnPost(page, 12 + Math.floor(Math.random() * 5));
-                    const left = await exitToGame(page);
+                const second = fresh[randInt(0, Math.min(fresh.length - 1, 5))];
+                if (await clickGame(page, second.href, B, log)) {
+                    await dwellOnPost(page, randInt(CFG.dwellMin, CFG.dwellMax), B, log);
+                    const left = await exitToGame(page, B, log);
                     if (!left) { try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {} }
                 }
             }
         }
 
-        log(`  Session done in ${Math.round((Date.now() - start) / 1000)}s`);
+        const duration = Date.now() - startTime;
+        ok(`Session done in ${Math.round(duration / 1000)}s`);
 
-        const dir = path.join(process.cwd(), "screenshots");
-        fs.mkdirSync(dir, { recursive: true });
-        await page.screenshot({
-            path: path.join(dir, `${tag}-${fingerprint.name.replace(/[^a-z0-9]/gi, '_')}.png`),
-            fullPage: true
-        }).catch(() => {});
+        if (CFG.screenshots) {
+            const dir = path.join(process.cwd(), "screenshots");
+            fs.mkdirSync(dir, { recursive: true });
+            await page.screenshot({
+                path: path.join(dir, `run-${RUN_ID}-bot-${botId}.png`),
+                fullPage: true
+            }).catch(() => {});
+        }
 
-        await pause(page, 1500, 2500);
+        await B.pause(page, 1500, 2500);
+        return { status: 'ok', duration };
 
-    } catch (error) {
-        log(`ERROR: ${error.message}`);
+    } catch (e) {
+        err(`Session error: ${e.message}`);
+        return { status: 'error', error: e.message, duration: Date.now() - startTime };
     } finally {
-        await browser.close().catch(() => {});
+        if (browser) await browser.close().catch(() => {});
     }
 }
 
-/* ============================================================
-   ⏰ المُوزِّع الزمني (يمنع الأنماط المنتظمة)
-   ============================================================ */
+async function clickGame(page, href, B, log) {
+    log(`  -> Clicking: ${href.substring(0, 70)}...`);
+    await scrollToHref(page, href);
+    const box = await boxOfHref(page, href);
+    if (!box || box.w < 30) { log("     ! box not found"); return false; }
+    const cx = box.x + box.w * (0.3 + rng() * 0.4);
+    const cy = box.y + box.h * (0.3 + rng() * 0.4);
+    if (rng() < 0.7) {
+        await B.moveMouse(page, cx, cy);
+        await B.pause(page, 120, 400);
+    }
+    try {
+        await Promise.all([
+            page.waitForURL(/\/\d{4}\/\d{2}\//, { timeout: 15000 }).catch(() => {}),
+            B.clickAt(page, cx, cy)
+        ]);
+        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    } catch (e) {}
+    if (/\/\d{4}\/\d{2}\//.test(page.url())) {
+        log(`     ✓ on post: ${page.url().substring(0, 70)}...`);
+        return true;
+    }
+    return false;
+}
 
-function generateLaunchTimes(count, windowMs) {
-    // Poisson-like distribution — يمنع الأنماط المنتظمة
+async function dwellOnPost(page, seconds, B, log) {
+    log(`     Reading for >=${seconds}s...`);
+    const t0 = Date.now();
+    while (Date.now() - t0 < seconds * 1000) {
+        const r = rng();
+        if (r < 0.4) { await B.scrollDown(page, randInt(150, 350)); await B.pause(page, 500, 1200); }
+        else if (r < 0.6) { await B.scrollUp(page, randInt(100, 220)); await B.pause(page, 400, 900); }
+        else { await B.microMoves(page, randInt(1, 3)); await B.pause(page, 400, 1000); }
+    }
+}
+
+async function exitToGame(page, B, log) {
+    log("     Looking for external link...");
+    const link = await findExternalLink(page);
+    if (!link) { log("     ! no external link"); return false; }
+    log(`     Found: "${link.text.substring(0, 40)}"`);
+    await scrollToHref(page, link.href);
+    const box = await boxOfHref(page, link.href);
+    if (!box || box.w < 20) return false;
+    const cx = box.x + box.w * (0.35 + rng() * 0.3);
+    const cy = box.y + box.h * (0.35 + rng() * 0.3);
+    if (rng() < 0.6) {
+        await B.moveMouse(page, cx, cy);
+        await B.pause(page, 200, 500);
+    }
+    try {
+        await Promise.all([
+            page.waitForURL(u => !u.toString().includes('blogspot.com'), { timeout: 15000 }).catch(() => {}),
+            B.clickAt(page, cx, cy)
+        ]);
+        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    } catch (e) {}
+    await B.pause(page, 1200, 2400);
+    if (!page.url().includes('blogspot.com')) {
+        log(`     ✓ LEFT -> ${page.url().substring(0, 60)}...`);
+        await B.pause(page, 700, 1400);
+        await B.microMoves(page, 2);
+        await B.scrollDown(page, randInt(150, 350));
+        await B.pause(page, 1000, 2000);
+        return true;
+    }
+    return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ⏰  Poisson-distributed scheduling
+   ═══════════════════════════════════════════════════════════════ */
+
+function poissonTimes(count, windowMs) {
     const times = [];
     const avgGap = windowMs / count;
     let t = 0;
     for (let i = 0; i < count; i++) {
-        // توزيع أسي (Poisson process)
-        const gap = -Math.log(Math.random()) * avgGap;
+        const gap = -Math.log(rng() || 0.0001) * avgGap;
         t += gap;
         times.push(Math.min(t, windowMs));
     }
     return times.sort((a, b) => a - b);
 }
 
-/* ============================================================
-   🎭 الأوضاع
-   ============================================================ */
+/* ═══════════════════════════════════════════════════════════════
+   🗂️  Persistent state
+   ═══════════════════════════════════════════════════════════════ */
 
-// ===== وضع single (بوت واحد) =====
+class State {
+    constructor() {
+        this.dir = path.join(process.cwd(), CFG.stateDir);
+        this.file = path.join(this.dir, 'state.json');
+        this.data = this.load();
+    }
+
+    load() {
+        try {
+            fs.mkdirSync(this.dir, { recursive: true });
+            if (fs.existsSync(this.file)) {
+                return JSON.parse(fs.readFileSync(this.file, 'utf8'));
+            }
+        } catch (e) {}
+        return {
+            lastRunAt: 0,
+            totalRuns: 0,
+            totalBots: 0,
+            fingerprintUsage: {},
+            recentRuns: []
+        };
+    }
+
+    save() {
+        try {
+            fs.mkdirSync(this.dir, { recursive: true });
+            // keep only last 50 runs
+            this.data.recentRuns = (this.data.recentRuns || []).slice(-50);
+            fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2), 'utf8');
+        } catch (e) {
+            console.error('State save error:', e.message);
+        }
+    }
+
+    recordRun(summary) {
+        this.data.lastRunAt = Date.now();
+        this.data.totalRuns++;
+        this.data.totalBots += summary.botCount || 0;
+        this.data.recentRuns.push({ runId: RUN_ID, ...summary, timestamp: new Date().toISOString() });
+        this.save();
+    }
+
+    shouldSkipCron() {
+        const elapsedMin = (Date.now() - this.data.lastRunAt) / 60000;
+        return elapsedMin < CFG.cronMinGapMin;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   🎭  Orchestrators
+   ═══════════════════════════════════════════════════════════════ */
+
+// ---------- single ----------
 async function runSingle() {
     const pool = ProxyPool.fromEnv();
     let proxy = null, proxyGeo = null;
 
     if (!pool.isEmpty()) {
         proxy = pool.pickLeastUsed();
-        if (proxy) {
-            // فحص سريع لـ IP + الموقع
-            const tempBrowser = await chromiumExtra.launch({ headless: true });
-            proxyGeo = await detectProxyGeo(tempBrowser, proxy);
-            await tempBrowser.close();
-            if (proxyGeo) {
-                console.log(`\n🌐 Proxy ${proxy.server} → ${proxyGeo.city}, ${proxyGeo.country} (${proxyGeo.ip})`);
-            }
-        }
+        if (proxy) proxyGeo = await detectGeo(proxy);
+    } else {
+        proxyGeo = await detectGeo(null);
     }
 
-    const baseFp = BASE_FINGERPRINTS[Math.floor(Math.random() * BASE_FINGERPRINTS.length)];
+    const baseFp = pick(BASE_FINGERPRINTS);
     const fp = buildFingerprintForGeo(baseFp, proxyGeo);
-    await runOneBot(BOT_ID, fp, { proxy, proxyGeo });
+    return await runOneBot(CFG.botId, fp, { proxy, proxyGeo });
 }
 
-// ===== وضع distributed (موزّع زمنياً عبر بروكسيات) =====
-async function runDistributed() {
-    const windowMs = WINDOW_MINUTES * 60 * 1000;
+// ---------- parallel ----------
+async function runParallel() {
+    LOG.info('MAIN', `Parallel: ${CFG.botCount} bots`);
     const pool = ProxyPool.fromEnv();
+    const limit = Math.max(1, CFG.parallelism);
+    const geoCaches = new Map();
 
-    console.log(`\n🌐 DISTRIBUTED MODE`);
-    console.log(`   Bots: ${BOT_COUNT}`);
-    console.log(`   Window: ${WINDOW_MINUTES} minutes`);
-    console.log(`   Max per IP: ${MAX_PER_IP}`);
-    console.log(`   Proxies: ${pool.size()}\n`);
-
-    if (pool.isEmpty()) {
-        console.log("⚠️  No proxies provided — falling back to spreading over time only.");
-        console.log("   Set PROXIES_JSON or PROXIES env, or place proxies.txt\n");
+    async function getGeo(proxy) {
+        const key = proxy ? proxy.server : '__local__';
+        if (geoCaches.has(key)) return geoCaches.get(key);
+        const g = await detectGeo(proxy);
+        geoCaches.set(key, g);
+        return g;
     }
 
-    // خريطة: ip → آخر استخدامات
-    const ipUsage = new Map();
+    const queue = Array.from({ length: CFG.botCount }, (_, i) => i + 1);
+    const results = [];
+    const running = new Set();
 
-    // توليد أوقات الإطلاق (توزيع Poisson)
-    const times = generateLaunchTimes(BOT_COUNT, windowMs);
+    async function launchBot(id) {
+        const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
+        const geo = await getGeo(proxy);
+        if (proxy) pool.markUsed(proxy);
+        const baseFp = BASE_FINGERPRINTS[(id - 1) % BASE_FINGERPRINTS.length];
+        const fp = buildFingerprintForGeo(baseFp, geo);
+        const res = await runOneBot(id, fp, { proxy, proxyGeo: geo });
+        results.push({ id, ...res });
+    }
 
-    console.log("Scheduled launch times (minutes from now):");
-    times.forEach((t, i) => console.log(`  Bot ${i + 1}: ${(t / 60000).toFixed(1)}m`));
-
-    const startTime = Date.now();
-    const usedFpNames = new Set();
-
-    const tasks = times.map((tOffset, i) => new Promise(async (resolve) => {
-        const waitMs = tOffset - (Date.now() - startTime);
-        if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
-
-        // اختر بروكسي بأقل استخدام
-        let proxy = null;
-        let proxyGeo = null;
-
-        if (!pool.isEmpty()) {
-            for (let attempt = 0; attempt < 5; attempt++) {
-                const candidate = pool.pickLeastUsed();
-                if (!candidate) break;
-
-                // تحقق من حد IP
-                const ipKey = candidate.server.split(':')[0];
-                const uses = ipUsage.get(ipKey) || 0;
-                if (uses >= MAX_PER_IP) {
-                    await new Promise(r => setTimeout(r, 15000));
-                    continue;
-                }
-
-                proxy = candidate;
-                ipUsage.set(ipKey, uses + 1);
-                break;
-            }
+    while (queue.length > 0 || running.size > 0) {
+        while (running.size < limit && queue.length > 0) {
+            const id = queue.shift();
+            const p = launchBot(id).finally(() => running.delete(p));
+            running.add(p);
         }
+        if (running.size > 0) await Promise.race([...running]);
+    }
 
-        // فحص الموقع الجغرافي للبروكسي
+    return { status: 'ok', results };
+}
+
+// ---------- sequential ----------
+async function runSequential() {
+    LOG.info('MAIN', `Sequential: ${CFG.botCount} bots`);
+    const pool = ProxyPool.fromEnv();
+    const results = [];
+
+    for (let i = 1; i <= CFG.botCount; i++) {
+        const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
+        let geo = null;
         if (proxy) {
-            try {
-                const tempBrowser = await chromiumExtra.launch({ headless: true });
-                proxyGeo = await detectProxyGeo(tempBrowser, proxy);
-                await tempBrowser.close();
-                if (proxyGeo) {
-                    console.log(`[BOT-${i + 1}] Proxy geo: ${proxyGeo.city}, ${proxyGeo.country} (${proxyGeo.ip})`);
-                }
-                pool.markUsed(proxy);
-            } catch (e) {
-                pool.markFailed(proxy);
-            }
+            geo = await detectGeo(proxy);
+            pool.markUsed(proxy);
+        } else {
+            geo = await detectGeo(null);
+        }
+        const baseFp = BASE_FINGERPRINTS[(i - 1) % BASE_FINGERPRINTS.length];
+        const fp = buildFingerprintForGeo(baseFp, geo);
+        const res = await runOneBot(i, fp, { proxy, proxyGeo: geo });
+        results.push({ id: i, ...res });
+
+        if (i < CFG.botCount) {
+            const gap = randInt(CFG.minGapSec, CFG.maxGapSec) * 1000;
+            LOG.info('MAIN', `Gap ${(gap / 1000).toFixed(0)}s before next bot`);
+            await sleep(gap);
+        }
+    }
+    return { status: 'ok', results };
+}
+
+// ---------- distributed ----------
+async function runDistributed() {
+    const windowMs = CFG.windowMinutes * 60 * 1000;
+    const pool = ProxyPool.fromEnv();
+    LOG.info('MAIN', `Distributed: ${CFG.botCount} bots over ${CFG.windowMinutes}m | Proxies: ${pool.size()}`);
+
+    const times = poissonTimes(CFG.botCount, windowMs);
+    LOG.info('MAIN', `Scheduled: ${times.map(t => (t / 60000).toFixed(1) + 'm').join(', ')}`);
+
+    const t0 = Date.now();
+    const results = [];
+
+    const tasks = times.map((offset, idx) => (async () => {
+        const wait = offset - (Date.now() - t0);
+        if (wait > 0) await sleep(wait);
+
+        const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
+        let geo = null;
+        if (proxy) {
+            geo = await detectGeo(proxy);
+            pool.markUsed(proxy);
+        } else {
+            geo = await detectGeo(null);
         }
 
-        // اختر بصمة أساسية متنوعة
-        let baseFp;
-        let tries = 0;
-        do {
-            baseFp = BASE_FINGERPRINTS[Math.floor(Math.random() * BASE_FINGERPRINTS.length)];
-            tries++;
-        } while (usedFpNames.has(baseFp.name) && tries < 5);
-        usedFpNames.add(baseFp.name);
-
-        const fp = buildFingerprintForGeo(baseFp, proxyGeo);
-        await runOneBot(i + 1, fp, { proxy, proxyGeo });
-
-        resolve();
-    }));
+        const baseFp = BASE_FINGERPRINTS[idx % BASE_FINGERPRINTS.length];
+        const fp = buildFingerprintForGeo(baseFp, geo);
+        const res = await runOneBot(idx + 1, fp, { proxy, proxyGeo: geo });
+        results.push({ id: idx + 1, ...res });
+    })());
 
     await Promise.all(tasks);
+    return { status: 'ok', results };
 }
 
-// ===== وضع matrix (GitHub Actions Matrix = runner منفصل لكل بوت) =====
-async function runMatrix() {
-    // في هذا الوضع، كل runner يشغّل بوت واحد فقط
-    // لكن البصمة تعتمد على BOT_ID لضمان التنوع
-    const pool = ProxyPool.fromEnv();
-    let proxy = null, proxyGeo = null;
+// ---------- campaign (multi-wave) ----------
+async function runCampaign() {
+    LOG.info('MAIN', `Campaign mode — planning waves over ${CFG.windowMinutes}m`);
+    const windowMs = CFG.windowMinutes * 60 * 1000;
 
-    if (!pool.isEmpty()) {
-        proxy = pool.pickLeastUsed();
-        if (proxy) {
-            const tempBrowser = await chromiumExtra.launch({ headless: true });
-            proxyGeo = await detectProxyGeo(tempBrowser, proxy);
-            await tempBrowser.close();
+    // 3-6 waves, each with 2-8 bots
+    const waveCount = randInt(3, 6);
+    const waves = [];
+    let remaining = CFG.botCount;
+
+    for (let i = 0; i < waveCount && remaining > 0; i++) {
+        const size = Math.min(remaining, randInt(2, 8));
+        waves.push(size);
+        remaining -= size;
+    }
+    if (remaining > 0) waves.push(remaining);
+
+    LOG.info('MAIN', `Waves: ${waves.join(' + ')} = ${CFG.botCount} bots`);
+
+    // Distribute wave start times with Poisson
+    const waveStarts = poissonTimes(waves.length, windowMs * 0.85);
+    const t0 = Date.now();
+    const results = [];
+
+    for (let wi = 0; wi < waves.length; wi++) {
+        const wait = waveStarts[wi] - (Date.now() - t0);
+        if (wait > 0) {
+            LOG.info('MAIN', `Waiting ${(wait / 60000).toFixed(1)}m for wave ${wi + 1}`);
+            await sleep(wait);
+        }
+
+        LOG.info('MAIN', `▶ Wave ${wi + 1}/${waves.length}: ${waves[wi]} bots`);
+        const savedCount = CFG.botCount;
+        CFG.botCount = waves[wi];
+        const r = await runParallel();
+        CFG.botCount = savedCount;
+        results.push(...(r.results || []));
+
+        // Small pause between waves
+        if (wi < waves.length - 1) {
+            const gap = randInt(30, 180) * 1000;
+            LOG.info('MAIN', `Wave gap ${(gap / 1000).toFixed(0)}s`);
+            await sleep(gap);
         }
     }
 
-    // اختر بصمة مبنية على BOT_ID + العشوائية
-    const botNum = parseInt(BOT_ID, 10) || 1;
-    const baseIdx = (botNum - 1) % BASE_FINGERPRINTS.length;
-    const baseFp = BASE_FINGERPRINTS[baseIdx];
-
-    const fp = buildFingerprintForGeo(baseFp, proxyGeo);
-
-    console.log(`\n🌐 MATRIX MODE — BOT_ID: ${BOT_ID}`);
-    if (proxyGeo) console.log(`   Proxy → ${proxyGeo.city}, ${proxyGeo.country} (${proxyGeo.ip})`);
-
-    await runOneBot(BOT_ID, fp, { proxy, proxyGeo });
+    return { status: 'ok', results, waves };
 }
 
-/* ============================================================
-   🚀 main
-   ============================================================ */
+// ---------- auto (cron mode) ----------
+async function runAuto() {
+    const state = new State();
+
+    if (state.shouldSkipCron()) {
+        const ago = Math.round((Date.now() - state.data.lastRunAt) / 60000);
+        LOG.info('MAIN', `Skipping: last run was ${ago}m ago (min gap ${CFG.cronMinGapMin}m)`);
+        return { status: 'skipped', reason: 'recent_run' };
+    }
+
+    // Pick random parameters
+    const modes = ['parallel', 'sequential', 'distributed', 'campaign'];
+    const chosenMode = pick(modes);
+    const count = randInt(2, Math.max(4, Math.min(12, CFG.botCount || 6)));
+
+    LOG.info('MAIN', `Auto-run: mode=${chosenMode}, count=${count}`);
+
+    const originalMode = CFG.mode;
+    const originalCount = CFG.botCount;
+    CFG.mode = chosenMode;
+    CFG.botCount = count;
+
+    let result;
+    try {
+        if (chosenMode === 'parallel') result = await runParallel();
+        else if (chosenMode === 'sequential') result = await runSequential();
+        else if (chosenMode === 'distributed') result = await runDistributed();
+        else if (chosenMode === 'campaign') result = await runCampaign();
+    } finally {
+        CFG.mode = originalMode;
+        CFG.botCount = originalCount;
+    }
+
+    state.recordRun({
+        mode: chosenMode,
+        botCount: count,
+        status: result?.status || 'unknown'
+    });
+
+    return result || { status: 'ok' };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   🚀  Main
+   ═══════════════════════════════════════════════════════════════ */
+
+function printBanner() {
+    console.log("╔══════════════════════════════════════════════════════╗");
+    console.log("║   BLOGGER BOT DETECTION LAB v3.0 — Anti-Cluster     ║");
+    console.log("╚══════════════════════════════════════════════════════╝");
+    console.log(`  Run ID:        ${RUN_ID}`);
+    console.log(`  Target:        ${CFG.targetUrl}`);
+    console.log(`  Mode:          ${CFG.mode}`);
+    console.log(`  Bot count:     ${CFG.botCount}`);
+    console.log(`  Parallelism:   ${CFG.parallelism}`);
+    console.log(`  Window:        ${CFG.windowMinutes} min`);
+    console.log(`  Max per IP:    ${CFG.maxPerIp}`);
+    console.log(`  Max duration:  ${CFG.maxDurationMin} min`);
+    console.log(`  Headless:      ${CFG.headless}`);
+    console.log("─────────────────────────────────────────────────────");
+}
 
 async function main() {
-    console.log("=================================");
-    console.log("BLOGGER BOT DETECTION LAB — ANTI-CLUSTER");
-    console.log("=================================");
-    console.log("Target:", TARGET_URL);
-    console.log("Mode:", BOT_MODE);
-    console.log("Bot ID:", BOT_ID);
-    console.log("Count:", BOT_COUNT);
+    printBanner();
 
-    const start = Date.now();
+    // حماية من التجاوز الزمني (مفيد في cron)
+    const timeout = setTimeout(() => {
+        LOG.warn('MAIN', `MAX_DURATION_MINUTES reached — exiting`);
+        process.exit(0);
+    }, CFG.maxDurationMin * 60 * 1000);
+    timeout.unref();
 
+    let summary;
     try {
-        if (BOT_MODE === "distributed") {
-            await runDistributed();
-        } else if (BOT_MODE === "matrix") {
-            await runMatrix();
-        } else {
-            await runSingle();
+        switch (CFG.mode) {
+            case 'parallel':    summary = await runParallel(); break;
+            case 'sequential':  summary = await runSequential(); break;
+            case 'distributed': summary = await runDistributed(); break;
+            case 'campaign':    summary = await runCampaign(); break;
+            case 'auto':        summary = await runAuto(); break;
+            case 'single':
+            default:            summary = await runSingle();
         }
+        const okCount = (summary?.results || []).filter(r => r.status === 'ok').length;
+        LOG.ok('MAIN', `Done in ${Math.round((Date.now() - START_TS) / 1000)}s | OK: ${okCount}/${(summary?.results || [1]).length}`);
     } catch (e) {
-        console.error("MAIN ERROR:", e);
+        LOG.error('MAIN', `Fatal: ${e.message}`);
         process.exitCode = 1;
     }
 
-    console.log(`\n✅ DONE in ${Math.round((Date.now() - start) / 1000)}s`);
+    clearTimeout(timeout);
+    await sleep(500);
+    process.exit(process.exitCode || 0);
 }
 
 main();
