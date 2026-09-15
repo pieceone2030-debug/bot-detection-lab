@@ -1,12 +1,16 @@
 {
   "name": "bot-detection-lab",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "private": true,
   "scripts": {
-    "test": "node bot-test.js",
-    "test:parallel": "BOT_MODE=parallel BOT_COUNT=3 node bot-test.js",
-    "test:sequential": "BOT_MODE=sequential BOT_COUNT=4 node bot-test.js",
-    "test:mixed": "BOT_MODE=mixed BOT_COUNT=5 node bot-test.js"
+    "start":           "node bot-test.js",
+    "test":            "node bot-test.js",
+    "run:single":      "BOT_MODE=single node bot-test.js",
+    "run:parallel":    "BOT_MODE=parallel BOT_COUNT=6 PARALLELISM=3 node bot-test.js",
+    "run:sequential":  "BOT_MODE=sequential BOT_COUNT=6 node bot-test.js",
+    "run:distributed": "BOT_MODE=distributed BOT_COUNT=12 WINDOW_MINUTES=30 node bot-test.js",
+    "run:campaign":    "BOT_MODE=campaign BOT_COUNT=20 WINDOW_MINUTES=60 node bot-test.js",
+    "run:auto":        "BOT_MODE=auto node bot-test.js"
   },
   "dependencies": {
     "patchright": "^1.62.1",
