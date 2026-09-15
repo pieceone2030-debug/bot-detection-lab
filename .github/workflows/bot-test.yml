@@ -1,41 +1,38 @@
-name: Bot Detection Lab — Anti-Cluster
+name: Bot Detection Lab
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Run mode'
+        description: 'Mode'
         required: true
-        default: 'matrix'
+        default: 'campaign'
         type: choice
-        options:
-          - matrix         # ← الأفضل ضد الكشف الجماعي (runner منفصل لكل بوت)
-          - distributed    # بوتات متعددة في runner واحد + بروكسيات + توزيع زمني
-          - single         # بوت واحد
-      bot_count:
-        description: 'Number of bots (for distributed)'
+        options: [single, parallel, sequential, distributed, campaign, auto]
+      count:
+        description: 'Bots'
         required: true
-        default: '8'
+        default: '12'
         type: string
-      window_minutes:
-        description: 'Time window in minutes (for distributed)'
+      parallelism:
+        description: 'Concurrent (parallel mode)'
         required: true
-        default: '30'
+        default: '3'
         type: string
+      window:
+        description: 'Window (minutes)'
+        required: true
+        default: '45'
+        type: string
+
+  # تشغيل تلقائي عبر Cron — كل 3 ساعات
+  schedule:
+    - cron: '15 */3 * * *'
 
 jobs:
-  # ========================================================
-  # وضع MATRIX — كل بوت على runner منفصل (IP مختلف)
-  # ========================================================
-  matrix-run:
-    if: ${{ github.event.inputs.mode == 'matrix' }}
+  run:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 3      # ← مهم: لا تشغّل كل البوتات في نفس اللحظة
-      matrix:
-        bot_id: [1, 2, 3, 4, 5, 6, 7, 8]
-
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -43,96 +40,31 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install npm packages
+      - name: Install packages
         run: npm install
 
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      - name: Random initial delay (avoid synchronized launch)
-        run: |
-          DELAY=$((RANDOM % 180))
-          echo "Sleeping ${DELAY}s before bot #${{ matrix.bot_id }}..."
-          sleep $DELAY
-
-      - name: Run bot ${{ matrix.bot_id }}
+      - name: Run bots
         env:
           TARGET_URL: https://pog01.blogspot.com/
-          BOT_MODE: matrix
-          BOT_ID: ${{ matrix.bot_id }}
-        run: npm test
-
-      - name: Upload screenshot
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-${{ matrix.bot_id }}-evidence
-          path: screenshots/
-          if-no-files-found: warn
-          retention-days: 3
-
-  # ========================================================
-  # وضع DISTRIBUTED — بوتات متعددة في runner واحد
-  # ========================================================
-  distributed-run:
-    if: ${{ github.event.inputs.mode == 'distributed' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: Install npm packages
-        run: npm install
-
-      - name: Install Patchright Chromium
-        run: npx patchright install --with-deps chromium
-
-      - name: Run distributed bots
-        env:
-          TARGET_URL: https://pog01.blogspot.com/
-          BOT_MODE: distributed
-          BOT_COUNT: ${{ github.event.inputs.bot_count }}
-          WINDOW_MINUTES: ${{ github.event.inputs.window_minutes }}
+          BOT_MODE: ${{ github.event.inputs.mode || 'auto' }}
+          BOT_COUNT: ${{ github.event.inputs.count || '12' }}
+          PARALLELISM: ${{ github.event.inputs.parallelism || '3' }}
+          WINDOW_MINUTES: ${{ github.event.inputs.window || '45' }}
+          MAX_DURATION_MINUTES: '55'
           MAX_PER_IP: '2'
+          CRON_MIN_GAP_MINUTES: '20'
           PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
         run: npm test
 
-      - name: Upload screenshots
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: distributed-evidence
-          path: screenshots/
-          if-no-files-found: warn
+          name: evidence-${{ github.run_id }}
+          path: |
+            screenshots/
+            .bot-state/
           retention-days: 3
-
-  # ========================================================
-  # وضع SINGLE
-  # ========================================================
-  single-run:
-    if: ${{ github.event.inputs.mode == 'single' }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - run: npm install
-      - run: npx patchright install --with-deps chromium
-      - name: Run single bot
-        env:
-          TARGET_URL: https://pog01.blogspot.com/
-          BOT_MODE: single
-          PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
-        run: npm test
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: single-evidence
-          path: screenshots/
