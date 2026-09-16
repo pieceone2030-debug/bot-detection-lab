@@ -4,7 +4,6 @@ name: Bot Detection Lab
 #  طرق التشغيل
 # ═════════════════════════════════════════════════════════════════
 on:
-  # 1) تشغيل يدوي من واجهة GitHub Actions
   workflow_dispatch:
     inputs:
       mode:
@@ -35,19 +34,15 @@ on:
         default: '45'
         type: string
 
-  # 2) تشغيل تلقائي عبر Cron — كل ساعة
+  # تشغيل تلقائي كل ساعة
   schedule:
-    - cron: '0 * * * *'      # كل ساعة عند الدقيقة 0 (UTC)
+    - cron: '0 * * * *'
 
-# ═════════════════════════════════════════════════════════════════
-#  الصلاحيات
 # ═════════════════════════════════════════════════════════════════
 permissions:
   contents: read
   actions: read
 
-# ═════════════════════════════════════════════════════════════════
-#  المهمة
 # ═════════════════════════════════════════════════════════════════
 jobs:
   run-bots:
@@ -55,42 +50,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    # منع تشغيل متزامن (إذا كان هناك تشغيل جارٍ، أوقف الجديد)
     concurrency:
       group: bot-detection-lab
       cancel-in-progress: false
 
     steps:
-      # ────────────────────────────────────────────────
-      # 1) سحب الكود
-      # ────────────────────────────────────────────────
+      # 1) Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ────────────────────────────────────────────────
-      # 2) تثبيت Node.js
-      # ────────────────────────────────────────────────
+      # 2) Setup Node.js (بدون cache!)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'npm'
 
-      # ────────────────────────────────────────────────
-      # 3) تثبيت الحزم
-      # ────────────────────────────────────────────────
+      # 3) Install npm packages
       - name: Install npm packages
         run: npm install
 
-      # ────────────────────────────────────────────────
-      # 4) تثبيت متصفح Patchright
-      # ────────────────────────────────────────────────
+      # 4) Install Patchright Chromium
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      # ────────────────────────────────────────────────
-      # 5) استرجاع الـ State (لمنع التشغيل المتكرر)
-      # ────────────────────────────────────────────────
+      # 5) Restore bot state
       - name: Restore bot state
         uses: actions/cache/restore@v4
         with:
@@ -99,57 +82,37 @@ jobs:
           restore-keys: |
             bot-state-
 
-      # ────────────────────────────────────────────────
-      # 6) تأخير عشوائي (يمنع التزامن بين cron-runs)
-      # ────────────────────────────────────────────────
+      # 6) Random jitter
       - name: Random jitter (avoid synchronized launches)
         run: |
           JITTER=$((RANDOM % 240))
           echo "Sleeping ${JITTER}s to add randomness..."
           sleep $JITTER
 
-      # ────────────────────────────────────────────────
-      # 7) تشغيل البوتات
-      # ────────────────────────────────────────────────
+      # 7) Run bots
       - name: Run bots
         env:
-          # ═══ الهدف ═══
           TARGET_URL: 'https://pog01.blogspot.com/'
-
-          # ═══ الوضع والعدد ═══
           BOT_MODE:   ${{ github.event.inputs.mode        || 'auto' }}
           BOT_COUNT:  ${{ github.event.inputs.count       || '15' }}
           PARALLELISM: ${{ github.event.inputs.parallelism || '3' }}
           WINDOW_MINUTES: ${{ github.event.inputs.window  || '45' }}
-
-          # ═══ الحدود والأمان ═══
           MAX_DURATION_MINUTES: '55'
           MAX_PER_IP: '2'
-          CRON_MIN_GAP_MINUTES: '45'      # لا يشغّل إذا كان آخر تشغيل قبل <45 دقيقة
-
-          # ═══ الفجوات في الوضع المتتالي ═══
+          CRON_MIN_GAP_MINUTES: '45'
           MIN_GAP_SECONDS: '15'
           MAX_GAP_SECONDS: '90'
-
-          # ═══ مدة البقاء على صفحة المقال ═══
           DWELL_MIN: '12'
           DWELL_MAX: '18'
-
-          # ═══ خيارات إضافية ═══
           HEADLESS: 'true'
           SCREENSHOTS: 'true'
           SAVE_HTML: 'false'
           STATE_DIR: '.bot-state'
           TZ_STRICT: 'true'
-
-          # ═══ البروكسيات (اختياري) ═══
-          # ضع PROXIES_JSON في GitHub Secrets إذا كان لديك بروكسيات
           PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
         run: npm test
 
-      # ────────────────────────────────────────────────
-      # 8) حفظ الـ State (للـ cron القادم)
-      # ────────────────────────────────────────────────
+      # 8) Save state
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
@@ -157,9 +120,7 @@ jobs:
           path: .bot-state
           key: bot-state-${{ github.run_id }}
 
-      # ────────────────────────────────────────────────
-      # 9) رفع المخرجات (لقطات + سجلات)
-      # ────────────────────────────────────────────────
+      # 9) Upload artifacts
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
