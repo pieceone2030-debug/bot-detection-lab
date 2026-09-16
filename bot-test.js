@@ -1,9 +1,5 @@
 /**
  * Bot Detection Lab v3.0 — Anti-Cluster Edition
- * ──────────────────────────────────────────────────────────────
- * Modes: single | parallel | sequential | distributed | campaign | auto
- * Cron-safe: uses .bot-state/state.json to avoid overlaps and repeats
- * ──────────────────────────────────────────────────────────────
  */
 'use strict';
 
@@ -19,9 +15,7 @@ const chromiumExtra = addExtra(chromium);
 chromiumExtra.use(StealthPlugin());
 chromiumExtra.use(AnonymizeUA());
 
-/* ═══════════════════════════════════════════════════════════════
-   ⚙️  الإعدادات — كل شيء قابل للتحكم عبر متغيرات البيئة
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ الإعدادات ═══════════ */
 
 const CFG = {
     targetUrl:        process.env.TARGET_URL        || "https://pog01.blogspot.com/",
@@ -60,14 +54,9 @@ function envBool(k, d) {
 const RUN_ID = process.env.RUN_ID || crypto.randomBytes(4).toString('hex');
 const START_TS = Date.now();
 
-/* ═══════════════════════════════════════════════════════════════
-   📝  Logger
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Logger ═══════════ */
 
-function ts() {
-    const d = new Date();
-    return d.toISOString().substring(11, 19);
-}
+function ts() { return new Date().toISOString().substring(11, 19); }
 const LOG = {
     info:  (id, m) => console.log(`[${ts()}] [${id}] ${m}`),
     warn:  (id, m) => console.warn(`[${ts()}] [${id}] ⚠️  ${m}`),
@@ -75,28 +64,20 @@ const LOG = {
     ok:    (id, m) => console.log(`[${ts()}] [${id}] ✅ ${m}`),
 };
 
-/* ═══════════════════════════════════════════════════════════════
-   🎲  Random utilities (deterministic if seed provided)
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Random ═══════════ */
 
 let rng = Math.random;
 if (CFG.randomSeed) {
     const seed = parseInt(CFG.randomSeed, 36) || 1;
     let s = seed >>> 0;
-    rng = () => {
-        s = (s * 1664525 + 1013904223) >>> 0;
-        return s / 0xFFFFFFFF;
-    };
+    rng = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xFFFFFFFF; };
 }
 
 const rand    = (a, b) => a + rng() * (b - a);
 const randInt = (a, b) => Math.floor(rand(a, b + 1));
 const pick    = arr => arr[Math.floor(rng() * arr.length)];
 const sleep   = ms => new Promise(r => setTimeout(r, ms));
-
-/* ═══════════════════════════════════════════════════════════════
-   🧬  Fingerprint database
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Fingerprint database ═══════════ */
 
 const BASE_FINGERPRINTS = [
     {
@@ -181,10 +162,6 @@ const BASE_FINGERPRINTS = [
     }
 ];
 
-/* ═══════════════════════════════════════════════════════════════
-   🌍  Geo profiles
-   ═══════════════════════════════════════════════════════════════ */
-
 const GEO_PROFILES = {
     'US': { locale: 'en-US', languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix'] },
     'CA': { locale: 'en-CA', languages: ['en-CA', 'en', 'fr'], timezones: ['America/Toronto', 'America/Vancouver'] },
@@ -236,37 +213,22 @@ function pickGeoProfile(countryCode) {
     return GEO_PROFILES[key] || GEO_PROFILES['US'];
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🌐  Proxy pool
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Proxy Pool ═══════════ */
 
 class ProxyPool {
     constructor(list) {
-        this.proxies = list.map(p => ({
-            ...p,
-            usage: 0,
-            lastUsed: 0,
-            failed: 0,
-            geo: null
-        }));
+        this.proxies = list.map(p => ({ ...p, usage: 0, lastUsed: 0, failed: 0, geo: null }));
     }
-
     static fromEnv() {
         if (process.env.PROXIES_JSON) {
-            try {
-                return new ProxyPool(JSON.parse(process.env.PROXIES_JSON));
-            } catch (e) { console.error('PROXIES_JSON parse error:', e.message); }
+            try { return new ProxyPool(JSON.parse(process.env.PROXIES_JSON)); }
+            catch (e) { console.error('PROXIES_JSON parse error:', e.message); }
         }
-        if (process.env.PROXIES) {
-            return new ProxyPool(parseProxyLines(process.env.PROXIES));
-        }
+        if (process.env.PROXIES) return new ProxyPool(parseProxyLines(process.env.PROXIES));
         const file = path.join(process.cwd(), 'proxies.txt');
-        if (fs.existsSync(file)) {
-            return new ProxyPool(parseProxyLines(fs.readFileSync(file, 'utf8')));
-        }
+        if (fs.existsSync(file)) return new ProxyPool(parseProxyLines(fs.readFileSync(file, 'utf8')));
         return new ProxyPool([]);
     }
-
     size() { return this.proxies.length; }
     isEmpty() { return this.proxies.length === 0; }
 
@@ -283,24 +245,11 @@ class ProxyPool {
             return (ipCount.get(ip) || 0) < maxPerIp;
         });
         if (candidates.length === 0) return null;
-        candidates.sort((a, b) => {
-            if (a.usage !== b.usage) return a.usage - b.usage;
-            return a.lastUsed - b.lastUsed;
-        });
+        candidates.sort((a, b) => a.usage !== b.usage ? a.usage - b.usage : a.lastUsed - b.lastUsed);
         return candidates[0];
     }
-
     markUsed(p) { if (p) { p.usage++; p.lastUsed = Date.now(); } }
     markFailed(p) { if (p) p.failed++; }
-
-    toJSON() {
-        return this.proxies.map(p => ({
-            server: p.server,
-            usage: p.usage,
-            failed: p.failed,
-            lastUsed: p.lastUsed
-        }));
-    }
 }
 
 function parseProxyLines(text) {
@@ -314,20 +263,14 @@ function parseProxyLines(text) {
     }).filter(Boolean);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🌍  Geo detection (uses a temp browser)
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Geo detection ═══════════ */
 
 async function detectGeo(proxy) {
     let browser;
     try {
         const opts = { headless: true };
         if (proxy) {
-            opts.proxy = {
-                server: `http://${proxy.server}`,
-                username: proxy.username,
-                password: proxy.password
-            };
+            opts.proxy = { server: `http://${proxy.server}`, username: proxy.username, password: proxy.password };
         }
         browser = await chromiumExtra.launch(opts);
         const ctx = await browser.newContext({
@@ -336,9 +279,7 @@ async function detectGeo(proxy) {
         });
         const page = await ctx.newPage();
         await page.goto('https://ipapi.co/json/', { waitUntil: 'domcontentloaded', timeout: 15000 });
-        const data = await page.evaluate(() => {
-            try { return JSON.parse(document.body.innerText); } catch (e) { return null; }
-        });
+        const data = await page.evaluate(() => { try { return JSON.parse(document.body.innerText); } catch (e) { return null; } });
         if (!data) return null;
         return {
             ip: data.ip,
@@ -349,31 +290,20 @@ async function detectGeo(proxy) {
             org: data.org,
             asn: data.asn
         };
-    } catch (e) {
-        return null;
-    } finally {
-        if (browser) await browser.close().catch(() => {});
-    }
+    } catch (e) { return null; }
+    finally { if (browser) await browser.close().catch(() => {}); }
 }
-
-/* ═══════════════════════════════════════════════════════════════
-   🧬  Build geo-matched fingerprint
-   ═══════════════════════════════════════════════════════════════ */
 
 function buildFingerprintForGeo(baseFp, geo) {
     const fp = JSON.parse(JSON.stringify(baseFp));
     const profile = pickGeoProfile(geo ? geo.country : 'US');
-
     fp.locale = profile.locale;
     fp.languages = [...profile.languages];
-
     if (geo && geo.timezone && TZ_OFFSETS[geo.timezone] !== undefined) {
         fp.timezone = geo.timezone;
     } else {
         fp.timezone = pick(profile.timezones);
     }
-
-    // subtle variations so two bots on the same proxy aren't identical
     const v = rng();
     if (v < 0.25) {
         fp.viewport.width  = Math.round(fp.viewport.width  * 0.92);
@@ -381,16 +311,12 @@ function buildFingerprintForGeo(baseFp, geo) {
     } else if (v < 0.5) {
         fp.screen.availHeight = fp.screen.height - randInt(20, 60);
     } else if (v < 0.7) {
-        const baseUA = fp.userAgent.replace(/Chrome\/\d+/, `Chrome/${randInt(120, 133)}`);
-        fp.userAgent = baseUA;
+        fp.userAgent = fp.userAgent.replace(/Chrome\/\d+/, `Chrome/${randInt(120, 133)}`);
     }
-    // 30% no change
     return fp;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🛡️  Stealth init script
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Stealth script ═══════════ */
 
 function buildStealthScript(fp) {
     return `
@@ -398,7 +324,6 @@ function buildStealthScript(fp) {
         'use strict';
         const FP = ${JSON.stringify(fp)};
         const navProto = Navigator.prototype;
-
         try {
             Object.defineProperty(navProto, 'userAgent', { get: () => FP.userAgent, configurable: true });
             Object.defineProperty(navProto, 'appVersion', { get: () => FP.userAgent.replace('Mozilla/', ''), configurable: true });
@@ -413,7 +338,7 @@ function buildStealthScript(fp) {
         } catch (e) {}
 
         try {
-            const makeMime = (type, suffixes, desc) => {
+            const mkMime = (type, suffixes, desc) => {
                 const m = Object.create(MimeType.prototype);
                 Object.defineProperty(m, 'type', { value: type });
                 Object.defineProperty(m, 'suffixes', { value: suffixes });
@@ -421,7 +346,7 @@ function buildStealthScript(fp) {
                 Object.defineProperty(m, 'enabledPlugin', { value: null });
                 return m;
             };
-            const makePlugin = (name, file, desc, mimes) => {
+            const mkPlugin = (name, file, desc, mimes) => {
                 const p = Object.create(Plugin.prototype);
                 Object.defineProperty(p, 'name', { value: name });
                 Object.defineProperty(p, 'filename', { value: file });
@@ -430,15 +355,15 @@ function buildStealthScript(fp) {
                 mimes.forEach((m, i) => Object.defineProperty(p, i, { value: m }));
                 return p;
             };
-            const pdf1 = makeMime('application/pdf', 'pdf', 'Portable Document Format');
-            const pdf2 = makeMime('text/pdf', 'pdf', 'Portable Document Format');
+            const pdf1 = mkMime('application/pdf', 'pdf', 'Portable Document Format');
+            const pdf2 = mkMime('text/pdf', 'pdf', 'Portable Document Format');
             const plugins = [
-                makePlugin('PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                makePlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                makePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                makePlugin('WebKit built-in PDF', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
-                makePlugin('Native Client', 'internal-nacl-plugin', '', [])
+                mkPlugin('PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                mkPlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                mkPlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                mkPlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                mkPlugin('WebKit built-in PDF', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
+                mkPlugin('Native Client', 'internal-nacl-plugin', '', [])
             ];
             const arr = Object.create(PluginArray.prototype);
             plugins.forEach((p, i) => Object.defineProperty(arr, i, { value: p }));
@@ -521,14 +446,11 @@ function buildStealthScript(fp) {
     `;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🎭  Behavior engine
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Behavior engine ═══════════ */
 
 function makeBehaviorEngine(log) {
     let mouseX = randInt(300, 1200);
     let mouseY = randInt(200, 800);
-
     const pause = (page, a, b) => page.waitForTimeout(randInt(a, b));
 
     async function moveMouse(page, tx, ty) {
@@ -547,7 +469,6 @@ function makeBehaviorEngine(log) {
         }
         mouseX = tx; mouseY = ty;
     }
-
     async function scrollDown(page, dy) {
         const chunks = randInt(3, 6);
         for (let i = 0; i < chunks; i++) {
@@ -555,7 +476,6 @@ function makeBehaviorEngine(log) {
             await page.waitForTimeout(randInt(35, 110));
         }
     }
-
     async function scrollUp(page, dy) {
         const chunks = randInt(2, 4);
         for (let i = 0; i < chunks; i++) {
@@ -563,14 +483,12 @@ function makeBehaviorEngine(log) {
             await page.waitForTimeout(randInt(45, 120));
         }
     }
-
     async function microMoves(page, n) {
         for (let i = 0; i < n; i++) {
             await moveMouse(page, mouseX + (rng() - 0.5) * 60, mouseY + (rng() - 0.5) * 35);
             await pause(page, 80, 260);
         }
     }
-
     async function clickAt(page, x, y) {
         await moveMouse(page, x, y);
         if (rng() < 0.35) {
@@ -585,13 +503,11 @@ function makeBehaviorEngine(log) {
         await page.waitForTimeout(randInt(45, 105));
         await page.mouse.up();
     }
-
     return { moveMouse, scrollDown, scrollUp, microMoves, clickAt, pause };
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🔎  Page analysis helpers
-   ═══════════════════════════════════════════════════════════════ */
+
+/* ═══════════ Page helpers ═══════════ */
 
 async function findCards(page) {
     let cards = await page.evaluate(() => {
@@ -609,9 +525,7 @@ async function findCards(page) {
         const s = new Set();
         return out.filter(o => { if (s.has(o.href)) return false; s.add(o.href); return true; });
     }).catch(() => []);
-
     if (cards.length >= 3) return cards;
-
     cards = await page.evaluate(() => {
         const out = [];
         document.querySelectorAll('a[href]').forEach(a => {
@@ -625,7 +539,6 @@ async function findCards(page) {
         const s = new Set();
         return out.filter(o => { if (s.has(o.href)) return false; s.add(o.href); return true; });
     }).catch(() => []);
-
     return cards;
 }
 
@@ -679,170 +592,6 @@ async function findExternalLink(page) {
             return c[0] || null;
         });
     } catch (e) { return null; }
-}
-
-/* ═══════════════════════════════════════════════════════════════
-   🎬  Bot session
-   ═══════════════════════════════════════════════════════════════ */
-
-async function runOneBot(botId, fingerprint, options = {}) {
-    const { proxy = null, proxyGeo = null } = options;
-    const tag = `BOT-${botId}`;
-    const log = (m) => LOG.info(tag, m);
-    const ok  = (m) => LOG.ok(tag, m);
-    const err = (m) => LOG.error(tag, m);
-
-    log(`Fingerprint: ${fingerprint.name}`);
-    log(`  UA: ${fingerprint.userAgent.substring(0, 70)}...`);
-    log(`  TZ: ${fingerprint.timezone} | Locale: ${fingerprint.locale} | GPU: ${fingerprint.gpuRenderer.substring(0, 45)}...`);
-    if (proxy) log(`  Proxy: ${proxy.server} → ${proxyGeo ? proxyGeo.city + ', ' + proxyGeo.country : '?'}`);
-
-    const B = makeBehaviorEngine(log);
-    const startTime = Date.now();
-
-    let browser, context, page;
-    try {
-        const launchArgs = [
-            `--user-agent=${fingerprint.userAgent}`,
-            `--lang=${fingerprint.languages[0]}`,
-            '--disable-blink-features=AutomationControlled',
-            '--no-sandbox', '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', '--no-first-run', '--no-zygote'
-        ];
-
-        const proxyConfig = proxy ? {
-            server: `http://${proxy.server}`,
-            username: proxy.username,
-            password: proxy.password
-        } : undefined;
-
-        browser = await chromiumExtra.launch({
-            headless: CFG.headless,
-            args: launchArgs,
-            proxy: proxyConfig
-        });
-
-        context = await browser.newContext({
-            viewport: fingerprint.viewport,
-            screen: { width: fingerprint.screen.width, height: fingerprint.screen.height },
-            userAgent: fingerprint.userAgent,
-            locale: fingerprint.locale,
-            timezoneId: fingerprint.timezone,
-            deviceScaleFactor: fingerprint.dsf,
-            colorScheme: 'light',
-            proxy: proxyConfig
-        });
-
-        await context.addInitScript(buildStealthScript(fingerprint));
-
-        page = await context.newPage();
-        page.on("framenavigated", f => {
-            if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 80)}`);
-        });
-
-        await page.goto(CFG.targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        log(`Loaded homepage`);
-
-        const liveFp = await page.evaluate(() => ({
-            wd: navigator.webdriver,
-            plugins: navigator.plugins.length,
-            cores: navigator.hardwareConcurrency,
-            tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            langs: navigator.languages.join(','),
-            gpu: (() => {
-                try {
-                    const c = document.createElement('canvas');
-                    const gl = c.getContext('webgl');
-                    const ext = gl.getExtension('WEBGL_debug_renderer_info');
-                    return gl.getParameter(ext.UNMASKED_RENDERER_WEBGL).substring(0, 55);
-                } catch (e) { return '?'; }
-            })()
-        }));
-        log(`  CHECK: wd=${liveFp.wd}, plugins=${liveFp.plugins}, cores=${liveFp.cores}, tz=${liveFp.tz}, langs=${liveFp.langs}`);
-
-        // --- Behavior ---
-        await B.microMoves(page, 2);
-        await B.pause(page, 150, 350);
-        await B.scrollDown(page, randInt(200, 380));
-        await B.pause(page, 250, 550);
-
-        let cards = await findCards(page);
-        log(`  Cards found: ${cards.length}`);
-        if (cards.length === 0) {
-            await B.scrollDown(page, 500);
-            await B.pause(page, 500, 1000);
-            cards = await findCards(page);
-            log(`  Retry cards: ${cards.length}`);
-        }
-        if (cards.length === 0) {
-            log("  No cards — aborting session");
-            return { status: 'no_cards', duration: Date.now() - startTime };
-        }
-
-        const r = rng();
-        const plan = r < 0.6 ? 'single-exit' : (r < 0.85 ? 'single-return' : 'double');
-        log(`  Plan: ${plan}`);
-
-        const first = cards[randInt(0, Math.min(cards.length - 1, 5))];
-        const ok1 = await clickGame(page, first.href, B, log);
-        if (!ok1) {
-            await B.pause(page, 800, 1500);
-            if (!/\/\d{4}\/\d{2}\//.test(page.url()) && cards.length > 1) {
-                await clickGame(page, cards[randInt(0, Math.min(cards.length - 1, 5))].href, B, log);
-            }
-        }
-
-        if (/\/\d{4}\/\d{2}\//.test(page.url())) {
-            await dwellOnPost(page, randInt(CFG.dwellMin, CFG.dwellMax), B, log);
-            if (plan === 'single-exit' || plan === 'double') {
-                const left = await exitToGame(page, B, log);
-                if (!left && plan === 'single-exit') {
-                    try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
-                    await B.pause(page, 700, 1400);
-                }
-            } else {
-                log("  Returning home");
-                try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
-                await B.pause(page, 700, 1400);
-            }
-        }
-
-        if (plan === 'double' && page.url().includes('blogspot.com') && !/\/\d{4}\/\d{2}\//.test(page.url())) {
-            await B.pause(page, 500, 1200);
-            await B.scrollDown(page, randInt(150, 320));
-            await B.pause(page, 400, 900);
-            const fresh = await findCards(page);
-            if (fresh.length > 1) {
-                const second = fresh[randInt(0, Math.min(fresh.length - 1, 5))];
-                if (await clickGame(page, second.href, B, log)) {
-                    await dwellOnPost(page, randInt(CFG.dwellMin, CFG.dwellMax), B, log);
-                    const left = await exitToGame(page, B, log);
-                    if (!left) { try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {} }
-                }
-            }
-        }
-
-        const duration = Date.now() - startTime;
-        ok(`Session done in ${Math.round(duration / 1000)}s`);
-
-        if (CFG.screenshots) {
-            const dir = path.join(process.cwd(), "screenshots");
-            fs.mkdirSync(dir, { recursive: true });
-            await page.screenshot({
-                path: path.join(dir, `run-${RUN_ID}-bot-${botId}.png`),
-                fullPage: true
-            }).catch(() => {});
-        }
-
-        await B.pause(page, 1500, 2500);
-        return { status: 'ok', duration };
-
-    } catch (e) {
-        err(`Session error: ${e.message}`);
-        return { status: 'error', error: e.message, duration: Date.now() - startTime };
-    } finally {
-        if (browser) await browser.close().catch(() => {});
-    }
 }
 
 async function clickGame(page, href, B, log) {
@@ -914,9 +663,127 @@ async function exitToGame(page, B, log) {
     return false;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   ⏰  Poisson-distributed scheduling
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Session runner ═══════════ */
+
+async function runOneBot(botId, fingerprint, options = {}) {
+    const { proxy = null, proxyGeo = null } = options;
+    const tag = `BOT-${botId}`;
+    const log = (m) => LOG.info(tag, m);
+    const ok  = (m) => LOG.ok(tag, m);
+    const err = (m) => LOG.error(tag, m);
+
+    log(`Fingerprint: ${fingerprint.name}`);
+    log(`  UA: ${fingerprint.userAgent.substring(0, 70)}...`);
+    log(`  TZ: ${fingerprint.timezone} | Locale: ${fingerprint.locale}`);
+    if (proxy) log(`  Proxy: ${proxy.server} → ${proxyGeo ? proxyGeo.city + ', ' + proxyGeo.country : '?'}`);
+
+    const B = makeBehaviorEngine(log);
+    const startTime = Date.now();
+
+    let browser, context, page;
+    try {
+        const launchArgs = [
+            `--user-agent=${fingerprint.userAgent}`,
+            `--lang=${fingerprint.languages[0]}`,
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox', '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage', '--no-first-run', '--no-zygote'
+        ];
+        const proxyConfig = proxy ? {
+            server: `http://${proxy.server}`,
+            username: proxy.username,
+            password: proxy.password
+        } : undefined;
+
+        browser = await chromiumExtra.launch({ headless: CFG.headless, args: launchArgs, proxy: proxyConfig });
+        context = await browser.newContext({
+            viewport: fingerprint.viewport,
+            screen: { width: fingerprint.screen.width, height: fingerprint.screen.height },
+            userAgent: fingerprint.userAgent,
+            locale: fingerprint.locale,
+            timezoneId: fingerprint.timezone,
+            deviceScaleFactor: fingerprint.dsf,
+            colorScheme: 'light',
+            proxy: proxyConfig
+        });
+        await context.addInitScript(buildStealthScript(fingerprint));
+        page = await context.newPage();
+        page.on("framenavigated", f => {
+            if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 80)}`);
+        });
+
+        await page.goto(CFG.targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+        log(`Loaded homepage`);
+
+        const liveFp = await page.evaluate(() => ({
+            wd: navigator.webdriver,
+            plugins: navigator.plugins.length,
+            tz: Intl.DateTimeFormat().resolvedOptions().timeZone
+        }));
+        log(`  CHECK: wd=${liveFp.wd}, plugins=${liveFp.plugins}, tz=${liveFp.tz}`);
+
+        await B.microMoves(page, 2);
+        await B.pause(page, 150, 350);
+        await B.scrollDown(page, randInt(200, 380));
+        await B.pause(page, 250, 550);
+
+        let cards = await findCards(page);
+        log(`  Cards found: ${cards.length}`);
+        if (cards.length === 0) {
+            await B.scrollDown(page, 500);
+            await B.pause(page, 500, 1000);
+            cards = await findCards(page);
+        }
+        if (cards.length === 0) { log("  No cards — aborting"); return { status: 'no_cards' }; }
+
+        const r = rng();
+        const plan = r < 0.6 ? 'single-exit' : (r < 0.85 ? 'single-return' : 'double');
+        log(`  Plan: ${plan}`);
+
+        const first = cards[randInt(0, Math.min(cards.length - 1, 5))];
+        const ok1 = await clickGame(page, first.href, B, log);
+        if (!ok1) {
+            await B.pause(page, 800, 1500);
+            if (!/\/\d{4}\/\d{2}\//.test(page.url()) && cards.length > 1) {
+                await clickGame(page, cards[randInt(0, Math.min(cards.length - 1, 5))].href, B, log);
+            }
+        }
+
+        if (/\/\d{4}\/\d{2}\//.test(page.url())) {
+            await dwellOnPost(page, randInt(CFG.dwellMin, CFG.dwellMax), B, log);
+            if (plan === 'single-exit' || plan === 'double') {
+                const left = await exitToGame(page, B, log);
+                if (!left && plan === 'single-exit') {
+                    try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
+                    await B.pause(page, 700, 1400);
+                }
+            } else {
+                try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
+                await B.pause(page, 700, 1400);
+            }
+        }
+
+        const duration = Date.now() - startTime;
+        ok(`Session done in ${Math.round(duration / 1000)}s`);
+
+        if (CFG.screenshots) {
+            const dir = path.join(process.cwd(), "screenshots");
+            fs.mkdirSync(dir, { recursive: true });
+            await page.screenshot({ path: path.join(dir, `run-${RUN_ID}-bot-${botId}.png`), fullPage: true }).catch(() => {});
+        }
+
+        await B.pause(page, 1500, 2500);
+        return { status: 'ok', duration };
+
+    } catch (e) {
+        err(`Session error: ${e.message}`);
+        return { status: 'error', error: e.message, duration: Date.now() - startTime };
+    } finally {
+        if (browser) await browser.close().catch(() => {});
+    }
+}
+
+/* ═══════════ Poisson scheduler ═══════════ */
 
 function poissonTimes(count, windowMs) {
     const times = [];
@@ -930,9 +797,7 @@ function poissonTimes(count, windowMs) {
     return times.sort((a, b) => a - b);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🗂️  Persistent state
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ State ═══════════ */
 
 class State {
     constructor() {
@@ -940,34 +805,20 @@ class State {
         this.file = path.join(this.dir, 'state.json');
         this.data = this.load();
     }
-
     load() {
         try {
             fs.mkdirSync(this.dir, { recursive: true });
-            if (fs.existsSync(this.file)) {
-                return JSON.parse(fs.readFileSync(this.file, 'utf8'));
-            }
+            if (fs.existsSync(this.file)) return JSON.parse(fs.readFileSync(this.file, 'utf8'));
         } catch (e) {}
-        return {
-            lastRunAt: 0,
-            totalRuns: 0,
-            totalBots: 0,
-            fingerprintUsage: {},
-            recentRuns: []
-        };
+        return { lastRunAt: 0, totalRuns: 0, totalBots: 0, recentRuns: [] };
     }
-
     save() {
         try {
             fs.mkdirSync(this.dir, { recursive: true });
-            // keep only last 50 runs
             this.data.recentRuns = (this.data.recentRuns || []).slice(-50);
             fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2), 'utf8');
-        } catch (e) {
-            console.error('State save error:', e.message);
-        }
+        } catch (e) { console.error('State save error:', e.message); }
     }
-
     recordRun(summary) {
         this.data.lastRunAt = Date.now();
         this.data.totalRuns++;
@@ -975,35 +826,28 @@ class State {
         this.data.recentRuns.push({ runId: RUN_ID, ...summary, timestamp: new Date().toISOString() });
         this.save();
     }
-
     shouldSkipCron() {
         const elapsedMin = (Date.now() - this.data.lastRunAt) / 60000;
         return elapsedMin < CFG.cronMinGapMin;
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🎭  Orchestrators
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Orchestrators ═══════════ */
 
-// ---------- single ----------
 async function runSingle() {
     const pool = ProxyPool.fromEnv();
     let proxy = null, proxyGeo = null;
-
     if (!pool.isEmpty()) {
         proxy = pool.pickLeastUsed();
         if (proxy) proxyGeo = await detectGeo(proxy);
     } else {
         proxyGeo = await detectGeo(null);
     }
-
     const baseFp = pick(BASE_FINGERPRINTS);
     const fp = buildFingerprintForGeo(baseFp, proxyGeo);
     return await runOneBot(CFG.botId, fp, { proxy, proxyGeo });
 }
 
-// ---------- parallel ----------
 async function runParallel() {
     LOG.info('MAIN', `Parallel: ${CFG.botCount} bots`);
     const pool = ProxyPool.fromEnv();
@@ -1017,7 +861,6 @@ async function runParallel() {
         geoCaches.set(key, g);
         return g;
     }
-
     const queue = Array.from({ length: CFG.botCount }, (_, i) => i + 1);
     const results = [];
     const running = new Set();
@@ -1040,145 +883,102 @@ async function runParallel() {
         }
         if (running.size > 0) await Promise.race([...running]);
     }
-
     return { status: 'ok', results };
 }
 
-// ---------- sequential ----------
 async function runSequential() {
     LOG.info('MAIN', `Sequential: ${CFG.botCount} bots`);
     const pool = ProxyPool.fromEnv();
     const results = [];
-
     for (let i = 1; i <= CFG.botCount; i++) {
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
-        let geo = null;
-        if (proxy) {
-            geo = await detectGeo(proxy);
-            pool.markUsed(proxy);
-        } else {
-            geo = await detectGeo(null);
-        }
+        let geo = proxy ? await detectGeo(proxy) : await detectGeo(null);
+        if (proxy) pool.markUsed(proxy);
         const baseFp = BASE_FINGERPRINTS[(i - 1) % BASE_FINGERPRINTS.length];
         const fp = buildFingerprintForGeo(baseFp, geo);
         const res = await runOneBot(i, fp, { proxy, proxyGeo: geo });
         results.push({ id: i, ...res });
-
         if (i < CFG.botCount) {
             const gap = randInt(CFG.minGapSec, CFG.maxGapSec) * 1000;
-            LOG.info('MAIN', `Gap ${(gap / 1000).toFixed(0)}s before next bot`);
+            LOG.info('MAIN', `Gap ${(gap / 1000).toFixed(0)}s`);
             await sleep(gap);
         }
     }
     return { status: 'ok', results };
 }
 
-// ---------- distributed ----------
 async function runDistributed() {
     const windowMs = CFG.windowMinutes * 60 * 1000;
     const pool = ProxyPool.fromEnv();
-    LOG.info('MAIN', `Distributed: ${CFG.botCount} bots over ${CFG.windowMinutes}m | Proxies: ${pool.size()}`);
-
+    LOG.info('MAIN', `Distributed: ${CFG.botCount} bots over ${CFG.windowMinutes}m`);
     const times = poissonTimes(CFG.botCount, windowMs);
     LOG.info('MAIN', `Scheduled: ${times.map(t => (t / 60000).toFixed(1) + 'm').join(', ')}`);
-
     const t0 = Date.now();
     const results = [];
-
     const tasks = times.map((offset, idx) => (async () => {
         const wait = offset - (Date.now() - t0);
         if (wait > 0) await sleep(wait);
-
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
-        let geo = null;
-        if (proxy) {
-            geo = await detectGeo(proxy);
-            pool.markUsed(proxy);
-        } else {
-            geo = await detectGeo(null);
-        }
-
+        let geo = proxy ? await detectGeo(proxy) : await detectGeo(null);
+        if (proxy) pool.markUsed(proxy);
         const baseFp = BASE_FINGERPRINTS[idx % BASE_FINGERPRINTS.length];
         const fp = buildFingerprintForGeo(baseFp, geo);
         const res = await runOneBot(idx + 1, fp, { proxy, proxyGeo: geo });
         results.push({ id: idx + 1, ...res });
     })());
-
     await Promise.all(tasks);
     return { status: 'ok', results };
 }
 
-// ---------- campaign (multi-wave) ----------
 async function runCampaign() {
-    LOG.info('MAIN', `Campaign mode — planning waves over ${CFG.windowMinutes}m`);
+    LOG.info('MAIN', `Campaign: ${CFG.botCount} bots over ${CFG.windowMinutes}m`);
     const windowMs = CFG.windowMinutes * 60 * 1000;
-
-    // 3-6 waves, each with 2-8 bots
     const waveCount = randInt(3, 6);
     const waves = [];
     let remaining = CFG.botCount;
-
     for (let i = 0; i < waveCount && remaining > 0; i++) {
         const size = Math.min(remaining, randInt(2, 8));
         waves.push(size);
         remaining -= size;
     }
     if (remaining > 0) waves.push(remaining);
-
-    LOG.info('MAIN', `Waves: ${waves.join(' + ')} = ${CFG.botCount} bots`);
-
-    // Distribute wave start times with Poisson
+    LOG.info('MAIN', `Waves: ${waves.join(' + ')}`);
     const waveStarts = poissonTimes(waves.length, windowMs * 0.85);
     const t0 = Date.now();
     const results = [];
-
     for (let wi = 0; wi < waves.length; wi++) {
         const wait = waveStarts[wi] - (Date.now() - t0);
-        if (wait > 0) {
-            LOG.info('MAIN', `Waiting ${(wait / 60000).toFixed(1)}m for wave ${wi + 1}`);
-            await sleep(wait);
-        }
-
+        if (wait > 0) { await sleep(wait); }
         LOG.info('MAIN', `▶ Wave ${wi + 1}/${waves.length}: ${waves[wi]} bots`);
         const savedCount = CFG.botCount;
         CFG.botCount = waves[wi];
         const r = await runParallel();
         CFG.botCount = savedCount;
         results.push(...(r.results || []));
-
-        // Small pause between waves
         if (wi < waves.length - 1) {
             const gap = randInt(30, 180) * 1000;
             LOG.info('MAIN', `Wave gap ${(gap / 1000).toFixed(0)}s`);
             await sleep(gap);
         }
     }
-
     return { status: 'ok', results, waves };
 }
 
-// ---------- auto (cron mode) ----------
 async function runAuto() {
     const state = new State();
-
     if (state.shouldSkipCron()) {
         const ago = Math.round((Date.now() - state.data.lastRunAt) / 60000);
-        LOG.info('MAIN', `Skipping: last run was ${ago}m ago (min gap ${CFG.cronMinGapMin}m)`);
-        return { status: 'skipped', reason: 'recent_run' };
+        LOG.info('MAIN', `Skipping: last run was ${ago}m ago`);
+        return { status: 'skipped' };
     }
-
-    // Pick random parameters
     const modes = ['parallel', 'sequential', 'distributed', 'campaign'];
     const chosenMode = pick(modes);
     const count = randInt(2, Math.max(4, Math.min(12, CFG.botCount || 6)));
-
     LOG.info('MAIN', `Auto-run: mode=${chosenMode}, count=${count}`);
-
     const originalMode = CFG.mode;
     const originalCount = CFG.botCount;
     CFG.mode = chosenMode;
     CFG.botCount = count;
-
     let result;
     try {
         if (chosenMode === 'parallel') result = await runParallel();
@@ -1189,42 +989,27 @@ async function runAuto() {
         CFG.mode = originalMode;
         CFG.botCount = originalCount;
     }
-
-    state.recordRun({
-        mode: chosenMode,
-        botCount: count,
-        status: result?.status || 'unknown'
-    });
-
+    state.recordRun({ mode: chosenMode, botCount: count, status: result?.status || 'unknown' });
     return result || { status: 'ok' };
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   🚀  Main
-   ═══════════════════════════════════════════════════════════════ */
+/* ═══════════ Main ═══════════ */
 
 function printBanner() {
-    console.log("╔══════════════════════════════════════════════════════╗");
-    console.log("║   BLOGGER BOT DETECTION LAB v3.0 — Anti-Cluster     ║");
-    console.log("╚══════════════════════════════════════════════════════╝");
+    console.log("╔═══════════════════════════════════════════════════╗");
+    console.log("║  BLOGGER BOT DETECTION LAB v3.0 — Anti-Cluster   ║");
+    console.log("╚═══════════════════════════════════════════════════╝");
     console.log(`  Run ID:        ${RUN_ID}`);
-    console.log(`  Target:        ${CFG.targetUrl}`);
     console.log(`  Mode:          ${CFG.mode}`);
     console.log(`  Bot count:     ${CFG.botCount}`);
-    console.log(`  Parallelism:   ${CFG.parallelism}`);
     console.log(`  Window:        ${CFG.windowMinutes} min`);
-    console.log(`  Max per IP:    ${CFG.maxPerIp}`);
-    console.log(`  Max duration:  ${CFG.maxDurationMin} min`);
-    console.log(`  Headless:      ${CFG.headless}`);
     console.log("─────────────────────────────────────────────────────");
 }
 
 async function main() {
     printBanner();
-
-    // حماية من التجاوز الزمني (مفيد في cron)
     const timeout = setTimeout(() => {
-        LOG.warn('MAIN', `MAX_DURATION_MINUTES reached — exiting`);
+        LOG.warn('MAIN', `MAX_DURATION reached — exiting`);
         process.exit(0);
     }, CFG.maxDurationMin * 60 * 1000);
     timeout.unref();
@@ -1241,15 +1026,15 @@ async function main() {
             default:            summary = await runSingle();
         }
         const okCount = (summary?.results || []).filter(r => r.status === 'ok').length;
-        LOG.ok('MAIN', `Done in ${Math.round((Date.now() - START_TS) / 1000)}s | OK: ${okCount}/${(summary?.results || [1]).length}`);
+        LOG.ok('MAIN', `Done in ${Math.round((Date.now() - START_TS) / 1000)}s | OK: ${okCount}`);
     } catch (e) {
         LOG.error('MAIN', `Fatal: ${e.message}`);
         process.exitCode = 1;
     }
-
     clearTimeout(timeout);
     await sleep(500);
     process.exit(process.exitCode || 0);
 }
 
 main();
+
