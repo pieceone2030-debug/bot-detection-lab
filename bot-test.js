@@ -333,7 +333,7 @@ function saveGeocache(proxy, geo) {
 
 async function detectGeo(proxy) {
     const cached = loadGeocache(proxy);
-    if (cached && cached.timezone && TZ_OFFSETS[cached.timezone] !== undefined) {
+    if (cached && cached.timezone && typeof cached.timezone === 'string' && TZ_OFFSETS[cached.timezone] !== undefined) {
         LOG.info('GEO', `Cache hit → ${cached.city}, ${cached.country} (${cached.timezone})`);
         return cached;
     }
@@ -354,7 +354,8 @@ async function detectGeo(proxy) {
         const apis = [
             'https://ipapi.co/json/',
             'https://ipwho.is/',
-            'https://ipinfo.io/json'
+            'https://ipinfo.io/json',
+            'https://ifconfig.co/json'
         ];
 
         let ip = null, country = null, timezone = null, city = null, org = null, asn = null, source = null;
@@ -362,48 +363,78 @@ async function detectGeo(proxy) {
         for (const apiUrl of apis) {
             try {
                 await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: 12000 });
-                const data = await page.evaluate(() => {
+                const raw = await page.evaluate(() => {
                     try { return JSON.parse(document.body.innerText); } catch (e) { return null; }
                 });
-                if (!data || !data.ip) continue;
+                if (!raw || !raw.ip) continue;
 
-                ip = data.ip;
+                // ⭐ Reset before each API
+                ip = raw.ip;
+                country = null;
+                timezone = null;
+                city = null;
+                org = null;
+                asn = null;
 
-                // ipapi.co format
-                if (data.country_code !== undefined) {
-                    country = (data.country_code || '').toUpperCase();
-                    timezone = data.timezone;
-                    city = data.city;
-                    org = data.org;
-                    asn = data.asn;
+                // ─── ipapi.co ───
+                if (raw.country_code !== undefined && typeof raw.timezone === 'string') {
+                    country = (raw.country_code || '').toUpperCase();
+                    timezone = raw.timezone;
+                    city = raw.city;
+                    org = raw.org;
+                    asn = raw.asn;
                     source = 'ipapi';
                 }
-                // ipwho.is format
-                else if (data.success === true) {
-                    country = (data.country_code || '').toUpperCase();
-                    timezone = data.timezone && data.timezone.id;
-                    city = data.city;
-                    org = data.connection && data.connection.org;
-                    asn = data.connection && data.connection.asn;
+                // ─── ipwho.is ─── (note: it also has country_code!)
+                else if (raw.success === true) {
+                    country = (raw.country_code || '').toUpperCase();
+                    // timezone is an OBJECT — extract .id
+                    if (raw.timezone) {
+                        timezone = typeof raw.timezone === 'string'
+                            ? raw.timezone
+                            : raw.timezone.id || null;
+                    }
+                    city = raw.city;
+                    org = raw.connection && raw.connection.org;
+                    asn = raw.connection && raw.connection.asn;
                     source = 'ipwho';
                 }
-                // ipinfo.io format
-                else if (data.country !== undefined) {
-                    country = (data.country || '').toUpperCase();
-                    timezone = data.timezone;
-                    city = data.city;
-                    org = data.org;
+                // ─── ipinfo.io ───
+                else if (raw.country !== undefined) {
+                    country = (raw.country || '').toUpperCase();
+                    timezone = typeof raw.timezone === 'string' ? raw.timezone : null;
+                    city = raw.city;
+                    org = raw.org;
                     source = 'ipinfo';
                 }
+                // ─── ifconfig.co ───
+                else if (raw.country_iso !== undefined) {
+                    country = (raw.country_iso || '').toUpperCase();
+                    timezone = typeof raw.time_zone === 'string' ? raw.time_zone : null;
+                    city = raw.city;
+                    source = 'ifconfig';
+                }
 
-                // ⚠️ CRITICAL: we MUST have timezone
-                if (!timezone) {
+                // Normalize: ensure timezone is a string, never an object
+                if (timezone && typeof timezone === 'object') {
+                    timezone = timezone.id || timezone.name || null;
+                }
+
+                // ⚠️ STRICT: must have country + timezone
+                if (!country || !timezone) {
                     LOG.warn('GEO', `${source} returned no timezone — trying next API`);
                     ip = null; country = null; timezone = null;
                     continue;
                 }
 
-                // ✅ Got complete data
+                // Validate timezone
+                if (TZ_OFFSETS[timezone] === undefined) {
+                    LOG.warn('GEO', `${source} returned unknown timezone "${timezone}" — trying next API`);
+                    ip = null; country = null; timezone = null;
+                    continue;
+                }
+
+                // ✅ Success
                 break;
             } catch (e) {
                 continue;
@@ -412,12 +443,6 @@ async function detectGeo(proxy) {
 
         if (!ip || !country || !timezone) {
             LOG.warn('GEO', `Failed to get complete geo for ${proxy ? proxy.server : 'local'}`);
-            return null;
-        }
-
-        // Validate timezone is in our known map
-        if (TZ_OFFSETS[timezone] === undefined) {
-            LOG.warn('GEO', `Unknown timezone "${timezone}" for country ${country}`);
             return null;
         }
 
@@ -431,7 +456,7 @@ async function detectGeo(proxy) {
             asn,
             source
         };
-        LOG.ok('GEO', `${city}, ${country} (${ip}) | TZ: ${timezone} | via ${source}`);
+        LOG.ok('GEO', `${city || '?'}, ${country} (${ip}) | TZ: ${timezone} | via ${source}`);
         saveGeocache(proxy, geo);
         return geo;
 
@@ -442,7 +467,6 @@ async function detectGeo(proxy) {
         if (browser) await browser.close().catch(() => {});
     }
 }
-
 /* ═══════════════════════════════════════════════════════════════
    🧬  Build fingerprint — v3.2 HARD TZ LOCK
    ═══════════════════════════════════════════════════════════════ */
