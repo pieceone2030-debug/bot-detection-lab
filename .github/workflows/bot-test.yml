@@ -1,44 +1,22 @@
 name: Bot Detection Lab
 
 # ═════════════════════════════════════════════════════════════════
-#  طرق التشغيل:
-#   1) workflow_dispatch: تشغيل يدوي كامل (campaign/distributed...)
-#   2) schedule: تلقائي كل 20 دقيقة → 3 بوتات من 3 IPs مختلفة
+#  نظامين فقط:
+#   1) Manual: اختبار يدوي (single bots متتالية من IP واحد — للاختبار فقط)
+#   2) Matrix: الإنتاج التلقائي (12 runner = 12 IP مختلف كل 15 دقيقة)
 # ═════════════════════════════════════════════════════════════════
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Mode'
-        required: true
-        default: 'campaign'
-        type: choice
-        options:
-          - single
-          - parallel
-          - sequential
-          - distributed
-          - campaign
-          - auto
       count:
-        description: 'Bots count'
-        required: true
-        default: '10'
-        type: string
-      parallelism:
-        description: 'Concurrent bots'
+        description: 'عدد البوتات للاختبار اليدوي (1-10)'
         required: true
         default: '3'
         type: string
-      window:
-        description: 'Window in minutes'
-        required: true
-        default: '30'
-        type: string
 
+  # الإنتاج — كل 15 دقيقة
   schedule:
-    # كل 20 دقيقة → 3 runners بالتوازي، كل واحد IP مختلف
-    - cron: '*/20 * * * *'
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
@@ -48,21 +26,21 @@ permissions:
 jobs:
 
   # ═══════════════════════════════════════════════════════════════
-  # 1) التشغيل اليدوي الكامل (لاختبار الأوضاع المتقدمة)
+  # Manual Test — للاختبار فقط (يدوي من GitHub UI)
   # ═══════════════════════════════════════════════════════════════
-  manual-run:
-    name: Manual (${{ github.event.inputs.mode }})
+  manual-test:
+    name: Manual Test
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     concurrency:
       group: bot-manual
       cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '24'
 
@@ -72,64 +50,65 @@ jobs:
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      - name: Random jitter
-        run: |
-          JITTER=$((RANDOM % 120))
-          echo "Sleeping ${JITTER}s..."
-          sleep $JITTER
-
-      - name: Run bots
+      - name: Run sequential bots (for testing only)
         env:
           TARGET_URL: 'https://pog01.blogspot.com/'
-          BOT_MODE:   ${{ github.event.inputs.mode }}
-          BOT_COUNT:  ${{ github.event.inputs.count }}
-          PARALLELISM: ${{ github.event.inputs.parallelism }}
-          WINDOW_MINUTES: ${{ github.event.inputs.window }}
-          MAX_DURATION_MINUTES: '55'
-          MAX_PER_IP: '2'
-          CRON_MIN_GAP_MINUTES: '0'
-          MIN_GAP_SECONDS: '15'
-          MAX_GAP_SECONDS: '120'
-          DWELL_MIN: '10'
-          DWELL_MAX: '20'
+          MAX_DURATION_MINUTES: '10'
           HEADLESS: 'true'
           SCREENSHOTS: 'false'
-          SAVE_HTML: 'false'
-          STATE_DIR: '.bot-state'
-          GEO_CACHE_DIR: '.geo-cache'
           GEO_STRICT: 'true'
-          PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
-        run: npm test
+        run: |
+          COUNT=${{ github.event.inputs.count }}
+          for i in $(seq 1 $COUNT); do
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "  Bot $i of $COUNT"
+            echo "════════════════════════════════════════"
+            BOT_MODE=single \
+            BOT_ID=$i \
+            BOT_COUNT=1 \
+            STATE_DIR=.bot-state-manual-$i \
+            GEO_CACHE_DIR=.geo-cache-manual-$i \
+            npm test || true
 
-      - name: Upload artifacts
+            if [ $i -lt $COUNT ]; then
+              GAP=$((RANDOM % 60 + 30))
+              echo "Waiting ${GAP}s before next bot..."
+              sleep $GAP
+            fi
+          done
+
+      - name: Upload manual artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: manual-evidence-${{ github.run_id }}
-          path: |
-            screenshots/
-            .bot-state/
+          path: .bot-state-manual-*/
           retention-days: 1
           if-no-files-found: ignore
 
   # ═══════════════════════════════════════════════════════════════
-  # 2) التشغيل التلقائي كل 20 دقيقة — Matrix 3 IPs
+  # Matrix — الإنتاج الرئيسي (12 runner = 12 IP مختلف)
   # ═══════════════════════════════════════════════════════════════
-  auto-matrix:
-    name: Auto Bot ${{ matrix.bot_id }}
+  matrix-bots:
+    name: Bot ${{ matrix.bot_id }}
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: bot-matrix
+      cancel-in-progress: false
+
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 3        # ← 3 متزامنة، 9 في الانتظار
       matrix:
-        bot_id: [1, 2, 3]
+        bot_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '24'
 
@@ -139,11 +118,11 @@ jobs:
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      - name: Random jitter per bot
+      # ⭐ تأخير عشوائي مختلف لكل بوت — يمنع التزامن الجماعي
+      - name: Random jitter
         run: |
-          # كل بوت يتأخر بوقت مختلف لتفادي التزامن
-          JITTER=$(( (RANDOM + ${{ matrix.bot_id }} * 47) % 180 ))
-          echo "Bot ${{ matrix.bot_id }} sleeping ${JITTER}s..."
+          JITTER=$(( (RANDOM + ${{ matrix.bot_id }} * 73) % 240 ))
+          echo "Bot ${{ matrix.bot_id }} will start after ${JITTER}s"
           sleep $JITTER
 
       - name: Run bot ${{ matrix.bot_id }}
@@ -152,7 +131,12 @@ jobs:
           BOT_MODE: 'single'
           BOT_ID: ${{ matrix.bot_id }}
           BOT_COUNT: '1'
-          MAX_DURATION_MINUTES: '12'
+          MAX_DURATION_MINUTES: '8'
+          MAX_PER_IP: '1'
+          MIN_GAP_SECONDS: '10'
+          MAX_GAP_SECONDS: '30'
+          DWELL_MIN: '10'
+          DWELL_MAX: '18'
           HEADLESS: 'true'
           SCREENSHOTS: 'false'
           SAVE_HTML: 'false'
