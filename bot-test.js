@@ -1,5 +1,16 @@
 /**
- * Bot Detection Lab v3.0 — Anti-Cluster Edition
+ * Bot Detection Lab v3.1 — Anti-Cluster + Geo-Strict Edition
+ * ─────────────────────────────────────────────────────────────
+ * Fixes:
+ *   • Robust geo detection (3 APIs + retry + cache)
+ *   • Instance-level WebGL fingerprint override
+ *   • Canvas noise injection
+ *   • Session variance (bounce / reader / engaged)
+ *   • Real referrers only (no fake Google/FB)
+ *   • Reject session if geo unknown
+ *   • Double jitter (launch + wave)
+ *   • Persistent state across cron runs
+ * ─────────────────────────────────────────────────────────────
  */
 'use strict';
 
@@ -15,7 +26,9 @@ const chromiumExtra = addExtra(chromium);
 chromiumExtra.use(StealthPlugin());
 chromiumExtra.use(AnonymizeUA());
 
-/* ═══════════ الإعدادات ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   ⚙️  Config
+   ═══════════════════════════════════════════════════════════════ */
 
 const CFG = {
     targetUrl:        process.env.TARGET_URL        || "https://pog01.blogspot.com/",
@@ -30,13 +43,12 @@ const CFG = {
     maxDurationMin:   intEnv("MAX_DURATION_MINUTES", 55),
     headless:         envBool("HEADLESS",           true),
     screenshots:      envBool("SCREENSHOTS",        true),
-    saveHtml:         envBool("SAVE_HTML",          false),
     dwellMin:         intEnv("DWELL_MIN",           12),
     dwellMax:         intEnv("DWELL_MAX",           17),
     stateDir:         process.env.STATE_DIR         || ".bot-state",
     cronMinGapMin:    intEnv("CRON_MIN_GAP_MINUTES", 20),
-    timezoneStrict:   envBool("TZ_STRICT",          true),
-    randomSeed:       process.env.RANDOM_SEED       || null,
+    geoStrict:        envBool("GEO_STRICT",         true),
+    geoCacheDir:      process.env.GEO_CACHE_DIR     || ".geo-cache",
 };
 
 function intEnv(k, d) {
@@ -54,7 +66,9 @@ function envBool(k, d) {
 const RUN_ID = process.env.RUN_ID || crypto.randomBytes(4).toString('hex');
 const START_TS = Date.now();
 
-/* ═══════════ Logger ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   📝  Logger
+   ═══════════════════════════════════════════════════════════════ */
 
 function ts() { return new Date().toISOString().substring(11, 19); }
 const LOG = {
@@ -64,20 +78,20 @@ const LOG = {
     ok:    (id, m) => console.log(`[${ts()}] [${id}] ✅ ${m}`),
 };
 
-/* ═══════════ Random ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🎲  RNG
+   ═══════════════════════════════════════════════════════════════ */
 
 let rng = Math.random;
-if (CFG.randomSeed) {
-    const seed = parseInt(CFG.randomSeed, 36) || 1;
-    let s = seed >>> 0;
-    rng = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xFFFFFFFF; };
-}
-
 const rand    = (a, b) => a + rng() * (b - a);
 const randInt = (a, b) => Math.floor(rand(a, b + 1));
 const pick    = arr => arr[Math.floor(rng() * arr.length)];
 const sleep   = ms => new Promise(r => setTimeout(r, ms));
-/* ═══════════ Fingerprint database ═══════════ */
+const shuffle = arr => { const a = [...arr]; for (let i = a.length-1; i>0; i--) { const j = Math.floor(rng()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; };
+
+/* ═══════════════════════════════════════════════════════════════
+   🧬  Fingerprint Database (8 distinct profiles)
+   ═══════════════════════════════════════════════════════════════ */
 
 const BASE_FINGERPRINTS = [
     {
@@ -141,7 +155,7 @@ const BASE_FINGERPRINTS = [
         cores: 8, memory: 16, colorDepth: 24, dsf: 1
     },
     {
-        name: "Mac-Intel-Iris",
+        name: "Mac-Intel-Iris-Plus",
         userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
         platform: "MacIntel",
         viewport: { width: 1680, height: 1050 },
@@ -151,7 +165,7 @@ const BASE_FINGERPRINTS = [
         cores: 4, memory: 8, colorDepth: 30, dsf: 2
     },
     {
-        name: "Win-AMD-Vega",
+        name: "Win-AMD-Vega8",
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         platform: "Win32",
         viewport: { width: 1600, height: 900 },
@@ -161,6 +175,10 @@ const BASE_FINGERPRINTS = [
         cores: 8, memory: 8, colorDepth: 24, dsf: 1
     }
 ];
+
+/* ═══════════════════════════════════════════════════════════════
+   🌍  Geo Profiles (country → locale + timezones)
+   ═══════════════════════════════════════════════════════════════ */
 
 const GEO_PROFILES = {
     'US': { locale: 'en-US', languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix'] },
@@ -213,7 +231,38 @@ function pickGeoProfile(countryCode) {
     return GEO_PROFILES[key] || GEO_PROFILES['US'];
 }
 
-/* ═══════════ Proxy Pool ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🔗  Real Referrer Sources (only realistic ones)
+   ═══════════════════════════════════════════════════════════════
+   We only use referrers that CAN realistically exist for an
+   unfindexed blog:
+     • Direct (empty) — from bookmarks, messaging apps, direct typing
+     • Blogger homepage — from blogger.com platform
+     • Blogger dashboard — from the blog owner's dashboard
+     • Internal navigation — between blog pages (already handled)
+   ═══════════════════════════════════════════════════════════════ */
+
+const REFERRER_SOURCES = [
+    { name: 'direct',           weight: 75, referer: '' },
+    { name: 'blogger-home',     weight: 12, referer: 'https://www.blogger.com/' },
+    { name: 'blogger-dashboard',weight: 8,  referer: 'https://www.blogger.com/blog/posts/' },
+    { name: 'blogger-feed',     weight: 3,  referer: 'https://www.blogger.com/feeds/posts/default' },
+    { name: 'blogger-profile',  weight: 2,  referer: 'https://www.blogger.com/profile/' }
+];
+
+function pickReferrerSource() {
+    const total = REFERRER_SOURCES.reduce((s, r) => s + r.weight, 0);
+    let r = rng() * total;
+    for (const src of REFERRER_SOURCES) {
+        r -= src.weight;
+        if (r <= 0) return src;
+    }
+    return REFERRER_SOURCES[0];
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   🌐  Proxy Pool
+   ═══════════════════════════════════════════════════════════════ */
 
 class ProxyPool {
     constructor(list) {
@@ -231,7 +280,6 @@ class ProxyPool {
     }
     size() { return this.proxies.length; }
     isEmpty() { return this.proxies.length === 0; }
-
     pickLeastUsed(maxPerIp = CFG.maxPerIp) {
         if (this.isEmpty()) return null;
         const ipCount = new Map();
@@ -263,9 +311,44 @@ function parseProxyLines(text) {
     }).filter(Boolean);
 }
 
-/* ═══════════ Geo detection ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🌍  Robust Geo Detection (3 APIs + cache + retry)
+   ═══════════════════════════════════════════════════════════════ */
+
+function geoCacheKey(proxy) {
+    return proxy ? crypto.createHash('md5').update(proxy.server).digest('hex').substring(0, 12) : 'local';
+}
+
+function loadGeocache(proxy) {
+    try {
+        const dir = path.join(process.cwd(), CFG.geoCacheDir);
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, `${geoCacheKey(proxy)}.json`);
+        if (!fs.existsSync(file)) return null;
+        const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
+        // cache valid for 6 hours
+        if (Date.now() - entry.ts > 6 * 3600 * 1000) return null;
+        return entry.geo;
+    } catch (e) { return null; }
+}
+
+function saveGeocache(proxy, geo) {
+    try {
+        const dir = path.join(process.cwd(), CFG.geoCacheDir);
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, `${geoCacheKey(proxy)}.json`);
+        fs.writeFileSync(file, JSON.stringify({ ts: Date.now(), geo }), 'utf8');
+    } catch (e) {}
+}
 
 async function detectGeo(proxy) {
+    // 1) check cache
+    const cached = loadGeocache(proxy);
+    if (cached) {
+        LOG.info('GEO', `Cache hit ${proxy ? proxy.server : 'local'} → ${cached.city}, ${cached.country}`);
+        return cached;
+    }
+
     let browser;
     try {
         const opts = { headless: true };
@@ -278,65 +361,160 @@ async function detectGeo(proxy) {
             proxy: opts.proxy
         });
         const page = await ctx.newPage();
-        await page.goto('https://ipapi.co/json/', { waitUntil: 'domcontentloaded', timeout: 15000 });
-        const data = await page.evaluate(() => { try { return JSON.parse(document.body.innerText); } catch (e) { return null; } });
-        if (!data) return null;
-        return {
-            ip: data.ip,
-            country: (data.country_code || '').toUpperCase(),
-            country_name: data.country_name,
-            timezone: data.timezone,
-            city: data.city,
-            org: data.org,
-            asn: data.asn
-        };
-    } catch (e) { return null; }
-    finally { if (browser) await browser.close().catch(() => {}); }
+
+        // 3 APIs in order of reliability
+        const apis = [
+            'https://ipapi.co/json/',
+            'https://ipwho.is/',
+            'https://api.ipify.org/?format=json'
+        ];
+
+        for (const apiUrl of apis) {
+            try {
+                await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: 12000 });
+                const data = await page.evaluate(() => {
+                    try { return JSON.parse(document.body.innerText); } catch (e) { return null; }
+                });
+                if (!data) continue;
+
+                let geo = null;
+                // ipapi.co
+                if (data.country_code !== undefined && data.ip) {
+                    geo = {
+                        ip: data.ip,
+                        country: (data.country_code || '').toUpperCase(),
+                        country_name: data.country_name,
+                        timezone: data.timezone,
+                        city: data.city,
+                        org: data.org,
+                        asn: data.asn,
+                        source: 'ipapi'
+                    };
+                }
+                // ipwho.is
+                else if (data.success === true && data.ip) {
+                    geo = {
+                        ip: data.ip,
+                        country: (data.country_code || '').toUpperCase(),
+                        country_name: data.country,
+                        timezone: data.timezone && data.timezone.id,
+                        city: data.city,
+                        org: data.connection && data.connection.org,
+                        asn: data.connection && data.connection.asn,
+                        source: 'ipwho'
+                    };
+                }
+                // ipify (only IP, no geo)
+                else if (data.ip && !data.country_code) {
+                    LOG.warn('GEO', `ipify returned only IP: ${data.ip}`);
+                    // continue to next API for geo
+                    continue;
+                }
+
+                if (geo && geo.ip) {
+                    LOG.ok('GEO', `${geo.city}, ${geo.country} (${geo.ip}) via ${geo.source}`);
+                    saveGeocache(proxy, geo);
+                    return geo;
+                }
+            } catch (e) { continue; }
+        }
+
+        LOG.warn('GEO', `All APIs failed for ${proxy ? proxy.server : 'local'}`);
+        return null;
+    } catch (e) {
+        LOG.error('GEO', `Detection error: ${e.message}`);
+        return null;
+    } finally {
+        if (browser) await browser.close().catch(() => {});
+    }
 }
 
-function buildFingerprintForGeo(baseFp, geo) {
+/* ═══════════════════════════════════════════════════════════════
+   🧬  Build geo-matched fingerprint
+   ═══════════════════════════════════════════════════════════════ */
+
+function buildFingerprintForGeo(baseFp, geo, options = {}) {
+    const { requireGeo = CFG.geoStrict } = options;
+
+    // ⚠️ Geo strict: if no geo, use SAFE fallback (US) — but log a warning
+    let effectiveGeo = geo;
+    if (!effectiveGeo) {
+        if (requireGeo) {
+            LOG.warn('FP', `No geo — using SAFE fallback (US)`);
+        }
+        effectiveGeo = { country: 'US', timezone: 'America/New_York' };
+    }
+
     const fp = JSON.parse(JSON.stringify(baseFp));
-    const profile = pickGeoProfile(geo ? geo.country : 'US');
+    const profile = pickGeoProfile(effectiveGeo.country);
+
     fp.locale = profile.locale;
     fp.languages = [...profile.languages];
-    if (geo && geo.timezone && TZ_OFFSETS[geo.timezone] !== undefined) {
-        fp.timezone = geo.timezone;
+
+    // ⭐ Timezone MUST match IP
+    if (effectiveGeo.timezone && TZ_OFFSETS[effectiveGeo.timezone] !== undefined) {
+        fp.timezone = effectiveGeo.timezone;
     } else {
+        // fallback: pick from profile but only if we truly have no IP timezone
         fp.timezone = pick(profile.timezones);
     }
+
+    // Add subtle variation per bot (same base fingerprint, different tweaks)
     const v = rng();
-    if (v < 0.25) {
+    if (v < 0.30) {
         fp.viewport.width  = Math.round(fp.viewport.width  * 0.92);
         fp.viewport.height = Math.round(fp.viewport.height * 0.92);
-    } else if (v < 0.5) {
+    } else if (v < 0.55) {
         fp.screen.availHeight = fp.screen.height - randInt(20, 60);
-    } else if (v < 0.7) {
+    } else if (v < 0.75) {
         fp.userAgent = fp.userAgent.replace(/Chrome\/\d+/, `Chrome/${randInt(120, 133)}`);
     }
+
     return fp;
 }
 
-/* ═══════════ Stealth script ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🛡️  Aggressive Stealth Script
+   ═══════════════════════════════════════════════════════════════ */
 
 function buildStealthScript(fp) {
+    const cfg = JSON.stringify({
+        ua: fp.userAgent,
+        platform: fp.platform,
+        languages: fp.languages,
+        cores: fp.cores,
+        memory: fp.memory,
+        screen: fp.screen,
+        colorDepth: fp.colorDepth,
+        gpuVendor: fp.gpuVendor,
+        gpuRenderer: fp.gpuRenderer,
+        timezone: fp.timezone,
+        tzOffset: TZ_OFFSETS[fp.timezone] !== undefined ? TZ_OFFSETS[fp.timezone] : 0
+    });
+
     return `
     (function () {
         'use strict';
-        const FP = ${JSON.stringify(fp)};
-        const navProto = Navigator.prototype;
-        try {
-            Object.defineProperty(navProto, 'userAgent', { get: () => FP.userAgent, configurable: true });
-            Object.defineProperty(navProto, 'appVersion', { get: () => FP.userAgent.replace('Mozilla/', ''), configurable: true });
-            Object.defineProperty(navProto, 'platform', { get: () => FP.platform, configurable: true });
-            Object.defineProperty(navProto, 'vendor', { get: () => 'Google Inc.', configurable: true });
-            Object.defineProperty(navProto, 'language', { get: () => FP.languages[0], configurable: true });
-            Object.defineProperty(navProto, 'languages', { get: () => Object.freeze([...FP.languages]), configurable: true });
-            Object.defineProperty(navProto, 'hardwareConcurrency', { get: () => FP.cores, configurable: true });
-            Object.defineProperty(navProto, 'deviceMemory', { get: () => FP.memory, configurable: true });
-            Object.defineProperty(navProto, 'maxTouchPoints', { get: () => 0, configurable: true });
-            Object.defineProperty(navProto, 'webdriver', { get: () => undefined, configurable: true });
-        } catch (e) {}
+        const FP = ${cfg};
 
+        // ═══════════ Navigator ═══════════
+        const navProto = Navigator.prototype;
+        const defProp = (obj, prop, getter) => {
+            try { Object.defineProperty(obj, prop, { get: getter, configurable: true }); }
+            catch (e) {}
+        };
+        defProp(navProto, 'userAgent', () => FP.ua);
+        defProp(navProto, 'appVersion', () => FP.ua.replace('Mozilla/', ''));
+        defProp(navProto, 'platform', () => FP.platform);
+        defProp(navProto, 'vendor', () => 'Google Inc.');
+        defProp(navProto, 'language', () => FP.languages[0]);
+        defProp(navProto, 'languages', () => Object.freeze([...FP.languages]));
+        defProp(navProto, 'hardwareConcurrency', () => FP.cores);
+        defProp(navProto, 'deviceMemory', () => FP.memory);
+        defProp(navProto, 'maxTouchPoints', () => 0);
+        defProp(navProto, 'webdriver', () => undefined);
+
+        // ═══════════ Plugins (real objects) ═══════════
         try {
             const mkMime = (type, suffixes, desc) => {
                 const m = Object.create(MimeType.prototype);
@@ -370,28 +548,59 @@ function buildStealthScript(fp) {
             Object.defineProperty(arr, 'length', { value: plugins.length });
             Object.defineProperty(arr, 'item', { value: i => plugins[i] || null });
             Object.defineProperty(arr, 'namedItem', { value: n => plugins.find(p => p.name === n) || null });
-            Object.defineProperty(navProto, 'plugins', { get: () => arr, configurable: true });
+            defProp(navProto, 'plugins', () => arr);
         } catch (e) {}
 
-        try {
-            const sp = Screen.prototype;
-            Object.defineProperty(sp, 'width', { get: () => FP.screen.width });
-            Object.defineProperty(sp, 'height', { get: () => FP.screen.height });
-            Object.defineProperty(sp, 'availWidth', { get: () => FP.screen.width });
-            Object.defineProperty(sp, 'availHeight', { get: () => FP.screen.availHeight });
-            Object.defineProperty(sp, 'colorDepth', { get: () => FP.colorDepth });
-            Object.defineProperty(sp, 'pixelDepth', { get: () => FP.colorDepth });
-        } catch (e) {}
+        // ═══════════ Screen ═══════════
+        const sp = Screen.prototype;
+        defProp(sp, 'width', () => FP.screen.width);
+        defProp(sp, 'height', () => FP.screen.height);
+        defProp(sp, 'availWidth', () => FP.screen.width);
+        defProp(sp, 'availHeight', () => FP.screen.availHeight);
+        defProp(sp, 'colorDepth', () => FP.colorDepth);
+        defProp(sp, 'pixelDepth', () => FP.colorDepth);
 
+        // ═══════════ WebGL — INSTANCE LEVEL ═══════════
+        // Most aggressive: hook at getContext level so every WebGL instance
+        // returns our fingerprint, regardless of how it's created.
         try {
-            const gp = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function (p) {
-                if (p === 37445) return FP.gpuVendor;
-                if (p === 37446) return FP.gpuRenderer;
-                if (p === 7936) return 'WebKit';
-                if (p === 7937) return 'WebKit WebGL';
-                return gp.call(this, p);
+            const patchCtx = (ctx) => {
+                if (!ctx) return ctx;
+                try {
+                    const origGetParam = ctx.getParameter.bind(ctx);
+                    Object.defineProperty(ctx, 'getParameter', {
+                        value: function (p) {
+                            if (p === 37445) return FP.gpuVendor;
+                            if (p === 37446) return FP.gpuRenderer;
+                            if (p === 7936) return 'WebKit';
+                            if (p === 7937) return 'WebKit WebGL';
+                            return origGetParam(p);
+                        },
+                        writable: false,
+                        configurable: false
+                    });
+                } catch (e) {}
+                return ctx;
             };
+            const origGetContext = HTMLCanvasElement.prototype.getContext;
+            HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+                const ctx = origGetContext.call(this, type, attrs);
+                if (ctx && (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2')) {
+                    return patchCtx(ctx);
+                }
+                return ctx;
+            };
+            // Also patch prototype for safety
+            if (window.WebGLRenderingContext) {
+                const gp = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function (p) {
+                    if (p === 37445) return FP.gpuVendor;
+                    if (p === 37446) return FP.gpuRenderer;
+                    if (p === 7936) return 'WebKit';
+                    if (p === 7937) return 'WebKit WebGL';
+                    return gp.call(this, p);
+                };
+            }
             if (window.WebGL2RenderingContext) {
                 const gp2 = WebGL2RenderingContext.prototype.getParameter;
                 WebGL2RenderingContext.prototype.getParameter = function (p) {
@@ -404,6 +613,30 @@ function buildStealthScript(fp) {
             }
         } catch (e) {}
 
+        // ═══════════ Canvas Noise (fingerprint defense) ═══════════
+        try {
+            const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
+                const imgData = origGetImageData.call(this, x, y, w, h);
+                // Add subtle noise to 0.01% of pixels
+                const data = imgData.data;
+                const pixelCount = data.length / 4;
+                const noiseCount = Math.max(1, Math.floor(pixelCount * 0.0001));
+                for (let i = 0; i < noiseCount; i++) {
+                    const idx = Math.floor(Math.random() * pixelCount) * 4;
+                    data[idx] = (data[idx] + 1) % 256;
+                }
+                return imgData;
+            };
+            if (CanvasRenderingContext2D.prototype.toDataURL) {
+                const origToDataURL = CanvasRenderingContext2D.prototype.toDataURL;
+                CanvasRenderingContext2D.prototype.toDataURL = function (...args) {
+                    return origToDataURL.apply(this, args);
+                };
+            }
+        } catch (e) {}
+
+        // ═══════════ Timezone ═══════════
         try {
             const origResolved = Intl.DateTimeFormat.prototype.resolvedOptions;
             Intl.DateTimeFormat.prototype.resolvedOptions = function () {
@@ -411,12 +644,10 @@ function buildStealthScript(fp) {
                 if (r.timeZone) r.timeZone = FP.timezone;
                 return r;
             };
-            const offset = ${JSON.stringify(TZ_OFFSETS)};
-            Date.prototype.getTimezoneOffset = function () {
-                return offset[FP.timezone] !== undefined ? offset[FP.timezone] : 0;
-            };
+            Date.prototype.getTimezoneOffset = function () { return FP.tzOffset; };
         } catch (e) {}
 
+        // ═══════════ Permissions ═══════════
         try {
             if (navigator.permissions && navigator.permissions.query) {
                 const oq = navigator.permissions.query.bind(navigator.permissions);
@@ -427,6 +658,7 @@ function buildStealthScript(fp) {
             }
         } catch (e) {}
 
+        // ═══════════ Chrome runtime ═══════════
         try {
             window.chrome = window.chrome || {};
             window.chrome.runtime = window.chrome.runtime || {};
@@ -435,6 +667,7 @@ function buildStealthScript(fp) {
             window.chrome.loadTimes = () => ({ commitLoadTime: Date.now()/1000, finishLoadTime: Date.now()/1000, navigationType: 'Other' });
         } catch (e) {}
 
+        // ═══════════ WebRTC leak ═══════════
         try {
             const oRTC = window.RTCPeerConnection;
             window.RTCPeerConnection = function (cfg) {
@@ -442,11 +675,24 @@ function buildStealthScript(fp) {
                 return new oRTC(cfg || { iceServers: [] });
             };
         } catch (e) {}
+
+        // ═══════════ Battery ═══════════
+        try {
+            if (navigator.getBattery) {
+                navigator.getBattery = () => Promise.resolve({
+                    charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1,
+                    onchargingchange: null, onchargingtimechange: null,
+                    ondischargingtimechange: null, onlevelchange: null
+                });
+            }
+        } catch (e) {}
     })();
     `;
 }
 
-/* ═══════════ Behavior engine ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🎭  Behavior Engine
+   ═══════════════════════════════════════════════════════════════ */
 
 function makeBehaviorEngine(log) {
     let mouseX = randInt(300, 1200);
@@ -469,6 +715,7 @@ function makeBehaviorEngine(log) {
         }
         mouseX = tx; mouseY = ty;
     }
+
     async function scrollDown(page, dy) {
         const chunks = randInt(3, 6);
         for (let i = 0; i < chunks; i++) {
@@ -503,11 +750,13 @@ function makeBehaviorEngine(log) {
         await page.waitForTimeout(randInt(45, 105));
         await page.mouse.up();
     }
+
     return { moveMouse, scrollDown, scrollUp, microMoves, clickAt, pause };
 }
 
-
-/* ═══════════ Page helpers ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🔎  Page helpers
+   ═══════════════════════════════════════════════════════════════ */
 
 async function findCards(page) {
     let cards = await page.evaluate(() => {
@@ -526,6 +775,7 @@ async function findCards(page) {
         return out.filter(o => { if (s.has(o.href)) return false; s.add(o.href); return true; });
     }).catch(() => []);
     if (cards.length >= 3) return cards;
+
     cards = await page.evaluate(() => {
         const out = [];
         document.querySelectorAll('a[href]').forEach(a => {
@@ -663,18 +913,24 @@ async function exitToGame(page, B, log) {
     return false;
 }
 
-/* ═══════════ Session runner ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🎬  Session Runner
+   ═══════════════════════════════════════════════════════════════ */
 
 async function runOneBot(botId, fingerprint, options = {}) {
-    const { proxy = null, proxyGeo = null } = options;
+    const { proxy = null, proxyGeo = null, referrerSource = null } = options;
     const tag = `BOT-${botId}`;
     const log = (m) => LOG.info(tag, m);
     const ok  = (m) => LOG.ok(tag, m);
     const err = (m) => LOG.error(tag, m);
 
+    // Choose referrer
+    const refSrc = referrerSource || pickReferrerSource();
+
     log(`Fingerprint: ${fingerprint.name}`);
     log(`  UA: ${fingerprint.userAgent.substring(0, 70)}...`);
     log(`  TZ: ${fingerprint.timezone} | Locale: ${fingerprint.locale}`);
+    log(`  Arrival: ${refSrc.name}${refSrc.referer ? ` (${refSrc.referer})` : ' (direct)'}`);
     if (proxy) log(`  Proxy: ${proxy.server} → ${proxyGeo ? proxyGeo.city + ', ' + proxyGeo.country : '?'}`);
 
     const B = makeBehaviorEngine(log);
@@ -706,25 +962,62 @@ async function runOneBot(botId, fingerprint, options = {}) {
             colorScheme: 'light',
             proxy: proxyConfig
         });
+
+        // Stealth script on context (applies to all future pages)
         await context.addInitScript(buildStealthScript(fingerprint));
+
         page = await context.newPage();
+        // Also apply to current page
+        await page.addInitScript(buildStealthScript(fingerprint));
+
         page.on("framenavigated", f => {
             if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 80)}`);
         });
 
-        await page.goto(CFG.targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        log(`Loaded homepage`);
+        // ⭐ Navigate with referrer
+        const gotoOpts = { waitUntil: "domcontentloaded", timeout: 60000 };
+        if (refSrc.referer) gotoOpts.referer = refSrc.referer;
 
+        await page.goto(CFG.targetUrl, gotoOpts);
+        log(`Loaded homepage via ${refSrc.name}`);
+
+        // Verify fingerprint
         const liveFp = await page.evaluate(() => ({
             wd: navigator.webdriver,
             plugins: navigator.plugins.length,
-            tz: Intl.DateTimeFormat().resolvedOptions().timeZone
+            cores: navigator.hardwareConcurrency,
+            tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            ref: document.referrer,
+            gpu: (() => {
+                try {
+                    const c = document.createElement('canvas');
+                    const gl = c.getContext('webgl');
+                    if (!gl) return '?';
+                    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                    return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL).substring(0, 60) : '?';
+                } catch (e) { return '?'; }
+            })()
         }));
         log(`  CHECK: wd=${liveFp.wd}, plugins=${liveFp.plugins}, tz=${liveFp.tz}`);
+        log(`  GPU: ${liveFp.gpu}`);
+        log(`  Ref: ${liveFp.ref.substring(0, 70)}`);
 
-        await B.microMoves(page, 2);
+        // ⭐ Session variance: bounce / reader / engaged
+        const sessionType = (() => {
+            const r = rng();
+            if (r < 0.25) return 'bounce';   // 25%: quick bounce
+            if (r < 0.85) return 'reader';   // 60%: normal reader
+            return 'engaged';                // 15%: deep engagement
+        })();
+        log(`  Session type: ${sessionType}`);
+
+        // Homepage browsing
+        await B.microMoves(page, sessionType === 'bounce' ? 1 : 2);
         await B.pause(page, 150, 350);
-        await B.scrollDown(page, randInt(200, 380));
+        await B.scrollDown(page, randInt(
+            sessionType === 'bounce' ? 100 : 200,
+            sessionType === 'engaged' ? 600 : 380
+        ));
         await B.pause(page, 250, 550);
 
         let cards = await findCards(page);
@@ -734,23 +1027,40 @@ async function runOneBot(botId, fingerprint, options = {}) {
             await B.pause(page, 500, 1000);
             cards = await findCards(page);
         }
-        if (cards.length === 0) { log("  No cards — aborting"); return { status: 'no_cards' }; }
+        if (cards.length === 0) { log("  No cards — aborting"); return { status: 'no_cards', sessionType }; }
 
-        const r = rng();
-        const plan = r < 0.6 ? 'single-exit' : (r < 0.85 ? 'single-return' : 'double');
+        // Plan
+        let plan;
+        if (sessionType === 'bounce') {
+            plan = rng() < 0.6 ? 'single-exit' : 'single-return';
+        } else if (sessionType === 'reader') {
+            const r = rng();
+            plan = r < 0.5 ? 'single-exit' : (r < 0.85 ? 'single-return' : 'double');
+        } else { // engaged
+            plan = rng() < 0.5 ? 'double' : 'single-return';
+        }
         log(`  Plan: ${plan}`);
 
-        const first = cards[randInt(0, Math.min(cards.length - 1, 5))];
+        // Choose games
+        const firstIdx = randInt(0, Math.min(cards.length - 1, 5));
+        const first = cards[firstIdx];
         const ok1 = await clickGame(page, first.href, B, log);
         if (!ok1) {
             await B.pause(page, 800, 1500);
             if (!/\/\d{4}\/\d{2}\//.test(page.url()) && cards.length > 1) {
-                await clickGame(page, cards[randInt(0, Math.min(cards.length - 1, 5))].href, B, log);
+                const alt = cards[randInt(0, Math.min(cards.length - 1, 5))];
+                await clickGame(page, alt.href, B, log);
             }
         }
 
+        // Post-page behavior
         if (/\/\d{4}\/\d{2}\//.test(page.url())) {
-            await dwellOnPost(page, randInt(CFG.dwellMin, CFG.dwellMax), B, log);
+            const dwellSec = sessionType === 'bounce'
+                ? randInt(3, 7)
+                : (sessionType === 'engaged' ? randInt(15, 25) : randInt(CFG.dwellMin, CFG.dwellMax));
+
+            await dwellOnPost(page, dwellSec, B, log);
+
             if (plan === 'single-exit' || plan === 'double') {
                 const left = await exitToGame(page, B, log);
                 if (!left && plan === 'single-exit') {
@@ -758,22 +1068,44 @@ async function runOneBot(botId, fingerprint, options = {}) {
                     await B.pause(page, 700, 1400);
                 }
             } else {
+                log("  Returning home");
                 try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {}
                 await B.pause(page, 700, 1400);
             }
         }
 
+        // Second game (double plan)
+        if (plan === 'double' && page.url().includes('blogspot.com') && !/\/\d{4}\/\d{2}\//.test(page.url())) {
+            await B.pause(page, 500, 1200);
+            await B.scrollDown(page, randInt(150, 320));
+            await B.pause(page, 400, 900);
+            const fresh = await findCards(page);
+            const remaining = fresh.filter(c => c.href !== first.href);
+            if (remaining.length) {
+                const second = remaining[randInt(0, Math.min(remaining.length - 1, 5))];
+                if (await clickGame(page, second.href, B, log)) {
+                    const dwellSec = randInt(CFG.dwellMin, CFG.dwellMax);
+                    await dwellOnPost(page, dwellSec, B, log);
+                    const left = await exitToGame(page, B, log);
+                    if (!left) { try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {} }
+                }
+            }
+        }
+
         const duration = Date.now() - startTime;
-        ok(`Session done in ${Math.round(duration / 1000)}s`);
+        ok(`Session done in ${Math.round(duration / 1000)}s | type: ${sessionType} | source: ${refSrc.name}`);
 
         if (CFG.screenshots) {
             const dir = path.join(process.cwd(), "screenshots");
             fs.mkdirSync(dir, { recursive: true });
-            await page.screenshot({ path: path.join(dir, `run-${RUN_ID}-bot-${botId}.png`), fullPage: true }).catch(() => {});
+            await page.screenshot({
+                path: path.join(dir, `run-${RUN_ID}-bot-${botId}.png`),
+                fullPage: true
+            }).catch(() => {});
         }
 
         await B.pause(page, 1500, 2500);
-        return { status: 'ok', duration };
+        return { status: 'ok', duration, sessionType, source: refSrc.name };
 
     } catch (e) {
         err(`Session error: ${e.message}`);
@@ -783,7 +1115,9 @@ async function runOneBot(botId, fingerprint, options = {}) {
     }
 }
 
-/* ═══════════ Poisson scheduler ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   ⏰  Poisson Scheduler with double jitter
+   ═══════════════════════════════════════════════════════════════ */
 
 function poissonTimes(count, windowMs) {
     const times = [];
@@ -797,7 +1131,9 @@ function poissonTimes(count, windowMs) {
     return times.sort((a, b) => a - b);
 }
 
-/* ═══════════ State ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🗂️  State (persistent across cron runs)
+   ═══════════════════════════════════════════════════════════════ */
 
 class State {
     constructor() {
@@ -810,14 +1146,14 @@ class State {
             fs.mkdirSync(this.dir, { recursive: true });
             if (fs.existsSync(this.file)) return JSON.parse(fs.readFileSync(this.file, 'utf8'));
         } catch (e) {}
-        return { lastRunAt: 0, totalRuns: 0, totalBots: 0, recentRuns: [] };
+        return { lastRunAt: 0, totalRuns: 0, totalBots: 0, fingerprintUsage: {}, recentRuns: [] };
     }
     save() {
         try {
             fs.mkdirSync(this.dir, { recursive: true });
             this.data.recentRuns = (this.data.recentRuns || []).slice(-50);
             fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2), 'utf8');
-        } catch (e) { console.error('State save error:', e.message); }
+        } catch (e) {}
     }
     recordRun(summary) {
         this.data.lastRunAt = Date.now();
@@ -832,7 +1168,9 @@ class State {
     }
 }
 
-/* ═══════════ Orchestrators ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🎭  Orchestrators
+   ═══════════════════════════════════════════════════════════════ */
 
 async function runSingle() {
     const pool = ProxyPool.fromEnv();
@@ -840,16 +1178,21 @@ async function runSingle() {
     if (!pool.isEmpty()) {
         proxy = pool.pickLeastUsed();
         if (proxy) proxyGeo = await detectGeo(proxy);
-    } else {
-        proxyGeo = await detectGeo(null);
     }
+    if (!proxyGeo) proxyGeo = await detectGeo(null);
+
+    if (CFG.geoStrict && !proxyGeo) {
+        LOG.error('MAIN', 'GEO_STRICT: cannot determine IP — aborting');
+        return { status: 'aborted_no_geo' };
+    }
+
     const baseFp = pick(BASE_FINGERPRINTS);
     const fp = buildFingerprintForGeo(baseFp, proxyGeo);
     return await runOneBot(CFG.botId, fp, { proxy, proxyGeo });
 }
 
 async function runParallel() {
-    LOG.info('MAIN', `Parallel: ${CFG.botCount} bots`);
+    LOG.info('MAIN', `Parallel: ${CFG.botCount} bots, concurrency ${CFG.parallelism}`);
     const pool = ProxyPool.fromEnv();
     const limit = Math.max(1, CFG.parallelism);
     const geoCaches = new Map();
@@ -861,14 +1204,25 @@ async function runParallel() {
         geoCaches.set(key, g);
         return g;
     }
+
     const queue = Array.from({ length: CFG.botCount }, (_, i) => i + 1);
     const results = [];
     const running = new Set();
 
     async function launchBot(id) {
+        // Small random delay before each bot (avoid simultaneous starts)
+        await sleep(randInt(0, 3000));
+
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
         const geo = await getGeo(proxy);
         if (proxy) pool.markUsed(proxy);
+
+        if (CFG.geoStrict && !geo) {
+            LOG.warn('MAIN', `Bot ${id}: no geo — skipping`);
+            results.push({ id, status: 'no_geo' });
+            return;
+        }
+
         const baseFp = BASE_FINGERPRINTS[(id - 1) % BASE_FINGERPRINTS.length];
         const fp = buildFingerprintForGeo(baseFp, geo);
         const res = await runOneBot(id, fp, { proxy, proxyGeo: geo });
@@ -894,10 +1248,16 @@ async function runSequential() {
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
         let geo = proxy ? await detectGeo(proxy) : await detectGeo(null);
         if (proxy) pool.markUsed(proxy);
+        if (CFG.geoStrict && !geo) {
+            LOG.warn('MAIN', `Bot ${i}: no geo — skipping`);
+            results.push({ id: i, status: 'no_geo' });
+            continue;
+        }
         const baseFp = BASE_FINGERPRINTS[(i - 1) % BASE_FINGERPRINTS.length];
         const fp = buildFingerprintForGeo(baseFp, geo);
         const res = await runOneBot(i, fp, { proxy, proxyGeo: geo });
         results.push({ id: i, ...res });
+
         if (i < CFG.botCount) {
             const gap = randInt(CFG.minGapSec, CFG.maxGapSec) * 1000;
             LOG.info('MAIN', `Gap ${(gap / 1000).toFixed(0)}s`);
@@ -915,17 +1275,26 @@ async function runDistributed() {
     LOG.info('MAIN', `Scheduled: ${times.map(t => (t / 60000).toFixed(1) + 'm').join(', ')}`);
     const t0 = Date.now();
     const results = [];
+
     const tasks = times.map((offset, idx) => (async () => {
         const wait = offset - (Date.now() - t0);
         if (wait > 0) await sleep(wait);
+        // Extra jitter (0-90s) to avoid synchronized starts
+        await sleep(randInt(0, 90000));
+
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
         let geo = proxy ? await detectGeo(proxy) : await detectGeo(null);
         if (proxy) pool.markUsed(proxy);
+        if (CFG.geoStrict && !geo) {
+            results.push({ id: idx + 1, status: 'no_geo' });
+            return;
+        }
         const baseFp = BASE_FINGERPRINTS[idx % BASE_FINGERPRINTS.length];
         const fp = buildFingerprintForGeo(baseFp, geo);
         const res = await runOneBot(idx + 1, fp, { proxy, proxyGeo: geo });
         results.push({ id: idx + 1, ...res });
     })());
+
     await Promise.all(tasks);
     return { status: 'ok', results };
 }
@@ -933,30 +1302,40 @@ async function runDistributed() {
 async function runCampaign() {
     LOG.info('MAIN', `Campaign: ${CFG.botCount} bots over ${CFG.windowMinutes}m`);
     const windowMs = CFG.windowMinutes * 60 * 1000;
-    const waveCount = randInt(3, 6);
+
+    // Generate waves with varying sizes
     const waves = [];
     let remaining = CFG.botCount;
-    for (let i = 0; i < waveCount && remaining > 0; i++) {
-        const size = Math.min(remaining, randInt(2, 8));
+    while (remaining > 0) {
+        const size = Math.min(remaining, randInt(2, 6));
         waves.push(size);
         remaining -= size;
     }
-    if (remaining > 0) waves.push(remaining);
-    LOG.info('MAIN', `Waves: ${waves.join(' + ')}`);
-    const waveStarts = poissonTimes(waves.length, windowMs * 0.85);
+    LOG.info('MAIN', `Waves: ${waves.join(' + ')} = ${waves.reduce((a, b) => a + b, 0)}`);
+
+    // Poisson times for wave starts
+    const waveStarts = poissonTimes(waves.length, windowMs * 0.80);
     const t0 = Date.now();
     const results = [];
+
     for (let wi = 0; wi < waves.length; wi++) {
         const wait = waveStarts[wi] - (Date.now() - t0);
-        if (wait > 0) { await sleep(wait); }
+        if (wait > 0) {
+            LOG.info('MAIN', `Waiting ${(wait / 60000).toFixed(1)}m for wave ${wi + 1}`);
+            await sleep(wait);
+        }
+        // Random jitter (0-60s) before wave
+        await sleep(randInt(0, 60000));
+
         LOG.info('MAIN', `▶ Wave ${wi + 1}/${waves.length}: ${waves[wi]} bots`);
         const savedCount = CFG.botCount;
         CFG.botCount = waves[wi];
         const r = await runParallel();
         CFG.botCount = savedCount;
         results.push(...(r.results || []));
+
         if (wi < waves.length - 1) {
-            const gap = randInt(30, 180) * 1000;
+            const gap = randInt(60, 240) * 1000;
             LOG.info('MAIN', `Wave gap ${(gap / 1000).toFixed(0)}s`);
             await sleep(gap);
         }
@@ -968,17 +1347,21 @@ async function runAuto() {
     const state = new State();
     if (state.shouldSkipCron()) {
         const ago = Math.round((Date.now() - state.data.lastRunAt) / 60000);
-        LOG.info('MAIN', `Skipping: last run was ${ago}m ago`);
-        return { status: 'skipped' };
+        LOG.info('MAIN', `Skipping: last run was ${ago}m ago (min gap ${CFG.cronMinGapMin}m)`);
+        return { status: 'skipped', reason: 'recent_run' };
     }
+
     const modes = ['parallel', 'sequential', 'distributed', 'campaign'];
     const chosenMode = pick(modes);
-    const count = randInt(2, Math.max(4, Math.min(12, CFG.botCount || 6)));
-    LOG.info('MAIN', `Auto-run: mode=${chosenMode}, count=${count}`);
+    const count = randInt(3, Math.max(4, Math.min(15, CFG.botCount || 8)));
+
+    LOG.info('MAIN', `Auto: mode=${chosenMode}, count=${count}`);
+
     const originalMode = CFG.mode;
     const originalCount = CFG.botCount;
     CFG.mode = chosenMode;
     CFG.botCount = count;
+
     let result;
     try {
         if (chosenMode === 'parallel') result = await runParallel();
@@ -989,27 +1372,37 @@ async function runAuto() {
         CFG.mode = originalMode;
         CFG.botCount = originalCount;
     }
+
     state.recordRun({ mode: chosenMode, botCount: count, status: result?.status || 'unknown' });
     return result || { status: 'ok' };
 }
 
-/* ═══════════ Main ═══════════ */
+/* ═══════════════════════════════════════════════════════════════
+   🚀  Main
+   ═══════════════════════════════════════════════════════════════ */
 
 function printBanner() {
-    console.log("╔═══════════════════════════════════════════════════╗");
-    console.log("║  BLOGGER BOT DETECTION LAB v3.0 — Anti-Cluster   ║");
-    console.log("╚═══════════════════════════════════════════════════╝");
+    console.log("╔══════════════════════════════════════════════════════╗");
+    console.log("║  BLOGGER BOT DETECTION LAB v3.1 — Geo-Strict        ║");
+    console.log("╚══════════════════════════════════════════════════════╝");
     console.log(`  Run ID:        ${RUN_ID}`);
+    console.log(`  Target:        ${CFG.targetUrl}`);
     console.log(`  Mode:          ${CFG.mode}`);
     console.log(`  Bot count:     ${CFG.botCount}`);
+    console.log(`  Parallelism:   ${CFG.parallelism}`);
     console.log(`  Window:        ${CFG.windowMinutes} min`);
-    console.log("─────────────────────────────────────────────────────");
+    console.log(`  Geo strict:    ${CFG.geoStrict}`);
+    console.log(`  Max per IP:    ${CFG.maxPerIp}`);
+    console.log(`  Max duration:  ${CFG.maxDurationMin} min`);
+    console.log(`  Headless:      ${CFG.headless}`);
+    console.log("──────────────────────────────────────────────────────");
 }
 
 async function main() {
     printBanner();
+
     const timeout = setTimeout(() => {
-        LOG.warn('MAIN', `MAX_DURATION reached — exiting`);
+        LOG.warn('MAIN', `MAX_DURATION_MINUTES reached — exiting`);
         process.exit(0);
     }, CFG.maxDurationMin * 60 * 1000);
     timeout.unref();
@@ -1031,10 +1424,10 @@ async function main() {
         LOG.error('MAIN', `Fatal: ${e.message}`);
         process.exitCode = 1;
     }
+
     clearTimeout(timeout);
     await sleep(500);
     process.exit(process.exitCode || 0);
 }
 
 main();
-
