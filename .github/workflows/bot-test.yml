@@ -1,13 +1,10 @@
 name: Bot Detection Lab
 
-# ═════════════════════════════════════════════════════════════════
-#  طرق التشغيل
-# ═════════════════════════════════════════════════════════════════
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Mode (auto = يختار عشوائياً)'
+        description: 'Mode'
         required: true
         default: 'auto'
         type: choice
@@ -31,19 +28,17 @@ on:
       window:
         description: 'Window in minutes (distributed/campaign)'
         required: true
-        default: '45'
+        default: '40'
         type: string
 
   # تشغيل تلقائي كل ساعة
   schedule:
     - cron: '0 * * * *'
 
-# ═════════════════════════════════════════════════════════════════
 permissions:
   contents: read
   actions: read
 
-# ═════════════════════════════════════════════════════════════════
 jobs:
   run-bots:
     name: Run bot session
@@ -55,72 +50,71 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      # 1) Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2) Setup Node.js (بدون cache!)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
-      # 3) Install npm packages
       - name: Install npm packages
         run: npm install
 
-      # 4) Install Patchright Chromium
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      # 5) Restore bot state
+      # استعادة الـ State من آخر تشغيل
       - name: Restore bot state
         uses: actions/cache/restore@v4
         with:
-          path: .bot-state
+          path: |
+            .bot-state
+            .geo-cache
           key: bot-state-${{ github.run_id }}
           restore-keys: |
             bot-state-
+            geo-cache-
 
-      # 6) Random jitter
-      - name: Random jitter (avoid synchronized launches)
+      # تأخير عشوائي لمنع التزامن مع cron-runs الأخرى
+      - name: Random jitter
         run: |
-          JITTER=$((RANDOM % 240))
-          echo "Sleeping ${JITTER}s to add randomness..."
+          JITTER=$((RANDOM % 180))
+          echo "Sleeping ${JITTER}s..."
           sleep $JITTER
 
-      # 7) Run bots
       - name: Run bots
         env:
           TARGET_URL: 'https://pog01.blogspot.com/'
           BOT_MODE:   ${{ github.event.inputs.mode        || 'auto' }}
           BOT_COUNT:  ${{ github.event.inputs.count       || '15' }}
           PARALLELISM: ${{ github.event.inputs.parallelism || '3' }}
-          WINDOW_MINUTES: ${{ github.event.inputs.window  || '45' }}
+          WINDOW_MINUTES: ${{ github.event.inputs.window  || '40' }}
           MAX_DURATION_MINUTES: '55'
           MAX_PER_IP: '2'
           CRON_MIN_GAP_MINUTES: '45'
           MIN_GAP_SECONDS: '15'
-          MAX_GAP_SECONDS: '90'
-          DWELL_MIN: '12'
-          DWELL_MAX: '18'
+          MAX_GAP_SECONDS: '120'
+          DWELL_MIN: '10'
+          DWELL_MAX: '20'
           HEADLESS: 'true'
           SCREENSHOTS: 'true'
           SAVE_HTML: 'false'
           STATE_DIR: '.bot-state'
-          TZ_STRICT: 'true'
+          GEO_CACHE_DIR: '.geo-cache'
+          GEO_STRICT: 'true'
           PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
         run: npm test
 
-      # 8) Save state
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .bot-state
+          path: |
+            .bot-state
+            .geo-cache
           key: bot-state-${{ github.run_id }}
 
-      # 9) Upload artifacts
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -129,5 +123,6 @@ jobs:
           path: |
             screenshots/
             .bot-state/
+            .geo-cache/
           retention-days: 3
           if-no-files-found: warn
