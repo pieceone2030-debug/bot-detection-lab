@@ -1,12 +1,17 @@
 name: Bot Detection Lab
 
+# ═════════════════════════════════════════════════════════════════
+#  طرق التشغيل:
+#   1) workflow_dispatch: تشغيل يدوي كامل (campaign/distributed...)
+#   2) schedule: تلقائي كل 20 دقيقة → 3 بوتات من 3 IPs مختلفة
+# ═════════════════════════════════════════════════════════════════
 on:
   workflow_dispatch:
     inputs:
       mode:
         description: 'Mode'
         required: true
-        default: 'auto'
+        default: 'campaign'
         type: choice
         options:
           - single
@@ -18,40 +23,43 @@ on:
       count:
         description: 'Bots count'
         required: true
-        default: '15'
+        default: '10'
         type: string
       parallelism:
-        description: 'Concurrent bots (parallel mode)'
+        description: 'Concurrent bots'
         required: true
         default: '3'
         type: string
       window:
-        description: 'Window in minutes (distributed/campaign)'
+        description: 'Window in minutes'
         required: true
-        default: '40'
+        default: '30'
         type: string
 
-  # تشغيل تلقائي كل ساعة
   schedule:
-    - cron: '0 * * * *'
+    # كل 20 دقيقة → 3 runners بالتوازي، كل واحد IP مختلف
+    - cron: '*/20 * * * *'
 
 permissions:
   contents: read
   actions: read
 
+# ═════════════════════════════════════════════════════════════════
 jobs:
-  run-bots:
-    name: Run bot session
+
+  # ═══════════════════════════════════════════════════════════════
+  # 1) التشغيل اليدوي الكامل (لاختبار الأوضاع المتقدمة)
+  # ═══════════════════════════════════════════════════════════════
+  manual-run:
+    name: Manual (${{ github.event.inputs.mode }})
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     concurrency:
-      group: bot-detection-lab
+      group: bot-manual
       cancel-in-progress: false
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -64,41 +72,28 @@ jobs:
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      # استعادة الـ State من آخر تشغيل
-      - name: Restore bot state
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            .bot-state
-            .geo-cache
-          key: bot-state-${{ github.run_id }}
-          restore-keys: |
-            bot-state-
-            geo-cache-
-
-      # تأخير عشوائي لمنع التزامن مع cron-runs الأخرى
       - name: Random jitter
         run: |
-          JITTER=$((RANDOM % 180))
+          JITTER=$((RANDOM % 120))
           echo "Sleeping ${JITTER}s..."
           sleep $JITTER
 
       - name: Run bots
         env:
           TARGET_URL: 'https://pog01.blogspot.com/'
-          BOT_MODE:   ${{ github.event.inputs.mode        || 'auto' }}
-          BOT_COUNT:  ${{ github.event.inputs.count       || '15' }}
-          PARALLELISM: ${{ github.event.inputs.parallelism || '3' }}
-          WINDOW_MINUTES: ${{ github.event.inputs.window  || '40' }}
+          BOT_MODE:   ${{ github.event.inputs.mode }}
+          BOT_COUNT:  ${{ github.event.inputs.count }}
+          PARALLELISM: ${{ github.event.inputs.parallelism }}
+          WINDOW_MINUTES: ${{ github.event.inputs.window }}
           MAX_DURATION_MINUTES: '55'
           MAX_PER_IP: '2'
-          CRON_MIN_GAP_MINUTES: '45'
+          CRON_MIN_GAP_MINUTES: '0'
           MIN_GAP_SECONDS: '15'
           MAX_GAP_SECONDS: '120'
           DWELL_MIN: '10'
           DWELL_MAX: '20'
           HEADLESS: 'true'
-          SCREENSHOTS: 'true'
+          SCREENSHOTS: 'false'
           SAVE_HTML: 'false'
           STATE_DIR: '.bot-state'
           GEO_CACHE_DIR: '.geo-cache'
@@ -106,23 +101,62 @@ jobs:
           PROXIES_JSON: ${{ secrets.PROXIES_JSON }}
         run: npm test
 
-      - name: Save bot state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            .bot-state
-            .geo-cache
-          key: bot-state-${{ github.run_id }}
-
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-${{ github.run_id }}
+          name: manual-evidence-${{ github.run_id }}
           path: |
             screenshots/
             .bot-state/
-            .geo-cache/
-          retention-days: 3
-          if-no-files-found: warn
+          retention-days: 1
+          if-no-files-found: ignore
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2) التشغيل التلقائي كل 20 دقيقة — Matrix 3 IPs
+  # ═══════════════════════════════════════════════════════════════
+  auto-matrix:
+    name: Auto Bot ${{ matrix.bot_id }}
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        bot_id: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install npm packages
+        run: npm install
+
+      - name: Install Patchright Chromium
+        run: npx patchright install --with-deps chromium
+
+      - name: Random jitter per bot
+        run: |
+          # كل بوت يتأخر بوقت مختلف لتفادي التزامن
+          JITTER=$(( (RANDOM + ${{ matrix.bot_id }} * 47) % 180 ))
+          echo "Bot ${{ matrix.bot_id }} sleeping ${JITTER}s..."
+          sleep $JITTER
+
+      - name: Run bot ${{ matrix.bot_id }}
+        env:
+          TARGET_URL: 'https://pog01.blogspot.com/'
+          BOT_MODE: 'single'
+          BOT_ID: ${{ matrix.bot_id }}
+          BOT_COUNT: '1'
+          MAX_DURATION_MINUTES: '12'
+          HEADLESS: 'true'
+          SCREENSHOTS: 'false'
+          SAVE_HTML: 'false'
+          GEO_STRICT: 'true'
+          STATE_DIR: '.bot-state-${{ matrix.bot_id }}'
+          GEO_CACHE_DIR: '.geo-cache-${{ matrix.bot_id }}'
+        run: npm test
