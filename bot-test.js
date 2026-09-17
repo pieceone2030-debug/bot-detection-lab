@@ -1185,11 +1185,17 @@ async function runSingle() {
         return { status: 'aborted_no_geo' };
     }
 
-    const baseFp = pick(BASE_FINGERPRINTS);
+    // ⭐ في وضع matrix: استخدم BOT_ID لاختيار بصمة محددة (بدل عشوائي)
+    // هذا يضمن أن كل runner يحصل على بصمة مختلفة
+    const botNum = parseInt(CFG.botId, 10) || 1;
+    const idx = (botNum - 1) % BASE_FINGERPRINTS.length;
+    const baseFp = BASE_FINGERPRINTS[idx];
     const fp = buildFingerprintForGeo(baseFp, proxyGeo);
+
+    LOG.info('MAIN', `Single mode: BOT_ID=${botNum} → fingerprint: ${baseFp.name}`);
+
     return await runOneBot(CFG.botId, fp, { proxy, proxyGeo });
 }
-
 async function runParallel() {
     LOG.info('MAIN', `Parallel: ${CFG.botCount} bots, concurrency ${CFG.parallelism}`);
     const pool = ProxyPool.fromEnv();
