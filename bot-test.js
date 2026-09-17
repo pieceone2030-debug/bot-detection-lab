@@ -1,15 +1,12 @@
 /**
- * Bot Detection Lab v3.1 — Anti-Cluster + Geo-Strict Edition
+ * Bot Detection Lab v3.2 — Geo-Strict Locked Edition
  * ─────────────────────────────────────────────────────────────
- * Fixes:
- *   • Robust geo detection (3 APIs + retry + cache)
- *   • Instance-level WebGL fingerprint override
- *   • Canvas noise injection
- *   • Session variance (bounce / reader / engaged)
- *   • Real referrers only (no fake Google/FB)
- *   • Reject session if geo unknown
- *   • Double jitter (launch + wave)
- *   • Persistent state across cron runs
+ * Fixes in v3.2:
+ *   • detectGeo: requires timezone from IP (no null fallback)
+ *   • buildFingerprintForGeo: throws if no valid timezone
+ *   • launchBot: skips bot if no geo instead of using random TZ
+ *   • Added ipinfo.io as 3rd API fallback
+ *   • Cache validation requires timezone field
  * ─────────────────────────────────────────────────────────────
  */
 'use strict';
@@ -82,15 +79,14 @@ const LOG = {
    🎲  RNG
    ═══════════════════════════════════════════════════════════════ */
 
-let rng = Math.random;
+const rng = Math.random;
 const rand    = (a, b) => a + rng() * (b - a);
 const randInt = (a, b) => Math.floor(rand(a, b + 1));
 const pick    = arr => arr[Math.floor(rng() * arr.length)];
 const sleep   = ms => new Promise(r => setTimeout(r, ms));
-const shuffle = arr => { const a = [...arr]; for (let i = a.length-1; i>0; i--) { const j = Math.floor(rng()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; };
 
 /* ═══════════════════════════════════════════════════════════════
-   🧬  Fingerprint Database (8 distinct profiles)
+   🧬  Fingerprint Database
    ═══════════════════════════════════════════════════════════════ */
 
 const BASE_FINGERPRINTS = [
@@ -177,7 +173,7 @@ const BASE_FINGERPRINTS = [
 ];
 
 /* ═══════════════════════════════════════════════════════════════
-   🌍  Geo Profiles (country → locale + timezones)
+   🌍  Geo Profiles
    ═══════════════════════════════════════════════════════════════ */
 
 const GEO_PROFILES = {
@@ -232,22 +228,15 @@ function pickGeoProfile(countryCode) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🔗  Real Referrer Sources (only realistic ones)
-   ═══════════════════════════════════════════════════════════════
-   We only use referrers that CAN realistically exist for an
-   unfindexed blog:
-     • Direct (empty) — from bookmarks, messaging apps, direct typing
-     • Blogger homepage — from blogger.com platform
-     • Blogger dashboard — from the blog owner's dashboard
-     • Internal navigation — between blog pages (already handled)
+   🔗  Real Referrer Sources
    ═══════════════════════════════════════════════════════════════ */
 
 const REFERRER_SOURCES = [
-    { name: 'direct',           weight: 75, referer: '' },
-    { name: 'blogger-home',     weight: 12, referer: 'https://www.blogger.com/' },
-    { name: 'blogger-dashboard',weight: 8,  referer: 'https://www.blogger.com/blog/posts/' },
-    { name: 'blogger-feed',     weight: 3,  referer: 'https://www.blogger.com/feeds/posts/default' },
-    { name: 'blogger-profile',  weight: 2,  referer: 'https://www.blogger.com/profile/' }
+    { name: 'direct',            weight: 75, referer: '' },
+    { name: 'blogger-home',      weight: 12, referer: 'https://www.blogger.com/' },
+    { name: 'blogger-dashboard', weight: 8,  referer: 'https://www.blogger.com/blog/posts/' },
+    { name: 'blogger-feed',      weight: 3,  referer: 'https://www.blogger.com/feeds/posts/default' },
+    { name: 'blogger-profile',   weight: 2,  referer: 'https://www.blogger.com/profile/' }
 ];
 
 function pickReferrerSource() {
@@ -312,7 +301,7 @@ function parseProxyLines(text) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🌍  Robust Geo Detection (3 APIs + cache + retry)
+   🌍  ROBUST Geo Detection — v3.2 STRICT
    ═══════════════════════════════════════════════════════════════ */
 
 function geoCacheKey(proxy) {
@@ -326,8 +315,9 @@ function loadGeocache(proxy) {
         const file = path.join(dir, `${geoCacheKey(proxy)}.json`);
         if (!fs.existsSync(file)) return null;
         const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
-        // cache valid for 6 hours
         if (Date.now() - entry.ts > 6 * 3600 * 1000) return null;
+        // ⚠️ STRICT: cache must contain timezone
+        if (!entry.geo || !entry.geo.timezone) return null;
         return entry.geo;
     } catch (e) { return null; }
 }
@@ -342,10 +332,9 @@ function saveGeocache(proxy, geo) {
 }
 
 async function detectGeo(proxy) {
-    // 1) check cache
     const cached = loadGeocache(proxy);
-    if (cached) {
-        LOG.info('GEO', `Cache hit ${proxy ? proxy.server : 'local'} → ${cached.city}, ${cached.country}`);
+    if (cached && cached.timezone && TZ_OFFSETS[cached.timezone] !== undefined) {
+        LOG.info('GEO', `Cache hit → ${cached.city}, ${cached.country} (${cached.timezone})`);
         return cached;
     }
 
@@ -362,12 +351,13 @@ async function detectGeo(proxy) {
         });
         const page = await ctx.newPage();
 
-        // 3 APIs in order of reliability
         const apis = [
             'https://ipapi.co/json/',
             'https://ipwho.is/',
-            'https://api.ipify.org/?format=json'
+            'https://ipinfo.io/json'
         ];
+
+        let ip = null, country = null, timezone = null, city = null, org = null, asn = null, source = null;
 
         for (const apiUrl of apis) {
             try {
@@ -375,52 +365,76 @@ async function detectGeo(proxy) {
                 const data = await page.evaluate(() => {
                     try { return JSON.parse(document.body.innerText); } catch (e) { return null; }
                 });
-                if (!data) continue;
+                if (!data || !data.ip) continue;
 
-                let geo = null;
-                // ipapi.co
-                if (data.country_code !== undefined && data.ip) {
-                    geo = {
-                        ip: data.ip,
-                        country: (data.country_code || '').toUpperCase(),
-                        country_name: data.country_name,
-                        timezone: data.timezone,
-                        city: data.city,
-                        org: data.org,
-                        asn: data.asn,
-                        source: 'ipapi'
-                    };
+                ip = data.ip;
+
+                // ipapi.co format
+                if (data.country_code !== undefined) {
+                    country = (data.country_code || '').toUpperCase();
+                    timezone = data.timezone;
+                    city = data.city;
+                    org = data.org;
+                    asn = data.asn;
+                    source = 'ipapi';
                 }
-                // ipwho.is
-                else if (data.success === true && data.ip) {
-                    geo = {
-                        ip: data.ip,
-                        country: (data.country_code || '').toUpperCase(),
-                        country_name: data.country,
-                        timezone: data.timezone && data.timezone.id,
-                        city: data.city,
-                        org: data.connection && data.connection.org,
-                        asn: data.connection && data.connection.asn,
-                        source: 'ipwho'
-                    };
+                // ipwho.is format
+                else if (data.success === true) {
+                    country = (data.country_code || '').toUpperCase();
+                    timezone = data.timezone && data.timezone.id;
+                    city = data.city;
+                    org = data.connection && data.connection.org;
+                    asn = data.connection && data.connection.asn;
+                    source = 'ipwho';
                 }
-                // ipify (only IP, no geo)
-                else if (data.ip && !data.country_code) {
-                    LOG.warn('GEO', `ipify returned only IP: ${data.ip}`);
-                    // continue to next API for geo
+                // ipinfo.io format
+                else if (data.country !== undefined) {
+                    country = (data.country || '').toUpperCase();
+                    timezone = data.timezone;
+                    city = data.city;
+                    org = data.org;
+                    source = 'ipinfo';
+                }
+
+                // ⚠️ CRITICAL: we MUST have timezone
+                if (!timezone) {
+                    LOG.warn('GEO', `${source} returned no timezone — trying next API`);
+                    ip = null; country = null; timezone = null;
                     continue;
                 }
 
-                if (geo && geo.ip) {
-                    LOG.ok('GEO', `${geo.city}, ${geo.country} (${geo.ip}) via ${geo.source}`);
-                    saveGeocache(proxy, geo);
-                    return geo;
-                }
-            } catch (e) { continue; }
+                // ✅ Got complete data
+                break;
+            } catch (e) {
+                continue;
+            }
         }
 
-        LOG.warn('GEO', `All APIs failed for ${proxy ? proxy.server : 'local'}`);
-        return null;
+        if (!ip || !country || !timezone) {
+            LOG.warn('GEO', `Failed to get complete geo for ${proxy ? proxy.server : 'local'}`);
+            return null;
+        }
+
+        // Validate timezone is in our known map
+        if (TZ_OFFSETS[timezone] === undefined) {
+            LOG.warn('GEO', `Unknown timezone "${timezone}" for country ${country}`);
+            return null;
+        }
+
+        const geo = {
+            ip,
+            country,
+            country_name: country,
+            timezone,
+            city,
+            org,
+            asn,
+            source
+        };
+        LOG.ok('GEO', `${city}, ${country} (${ip}) | TZ: ${timezone} | via ${source}`);
+        saveGeocache(proxy, geo);
+        return geo;
+
     } catch (e) {
         LOG.error('GEO', `Detection error: ${e.message}`);
         return null;
@@ -430,36 +444,31 @@ async function detectGeo(proxy) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🧬  Build geo-matched fingerprint
+   🧬  Build fingerprint — v3.2 HARD TZ LOCK
    ═══════════════════════════════════════════════════════════════ */
 
 function buildFingerprintForGeo(baseFp, geo, options = {}) {
     const { requireGeo = CFG.geoStrict } = options;
 
-    // ⚠️ Geo strict: if no geo, use SAFE fallback (US) — but log a warning
-    let effectiveGeo = geo;
-    if (!effectiveGeo) {
+    // ⚠️ STRICT: throw if no valid timezone — prevents TZ mismatch
+    if (!geo || !geo.timezone || TZ_OFFSETS[geo.timezone] === undefined) {
         if (requireGeo) {
-            LOG.warn('FP', `No geo — using SAFE fallback (US)`);
+            throw new Error('GEO_STRICT: missing valid timezone from IP');
         }
-        effectiveGeo = { country: 'US', timezone: 'America/New_York' };
+        // Non-strict fallback (only if explicitly disabled)
+        LOG.warn('FP', 'NON-STRICT fallback: using America/New_York');
+        geo = { country: 'US', timezone: 'America/New_York' };
     }
 
     const fp = JSON.parse(JSON.stringify(baseFp));
-    const profile = pickGeoProfile(effectiveGeo.country);
+    const profile = pickGeoProfile(geo.country);
 
+    // ⭐ HARD LOCK: timezone comes ONLY from IP
+    fp.timezone = geo.timezone;
     fp.locale = profile.locale;
     fp.languages = [...profile.languages];
 
-    // ⭐ Timezone MUST match IP
-    if (effectiveGeo.timezone && TZ_OFFSETS[effectiveGeo.timezone] !== undefined) {
-        fp.timezone = effectiveGeo.timezone;
-    } else {
-        // fallback: pick from profile but only if we truly have no IP timezone
-        fp.timezone = pick(profile.timezones);
-    }
-
-    // Add subtle variation per bot (same base fingerprint, different tweaks)
+    // Subtle per-bot variations
     const v = rng();
     if (v < 0.30) {
         fp.viewport.width  = Math.round(fp.viewport.width  * 0.92);
@@ -474,7 +483,7 @@ function buildFingerprintForGeo(baseFp, geo, options = {}) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🛡️  Aggressive Stealth Script
+   🛡️  Stealth Script
    ═══════════════════════════════════════════════════════════════ */
 
 function buildStealthScript(fp) {
@@ -496,12 +505,9 @@ function buildStealthScript(fp) {
     (function () {
         'use strict';
         const FP = ${cfg};
-
-        // ═══════════ Navigator ═══════════
         const navProto = Navigator.prototype;
         const defProp = (obj, prop, getter) => {
-            try { Object.defineProperty(obj, prop, { get: getter, configurable: true }); }
-            catch (e) {}
+            try { Object.defineProperty(obj, prop, { get: getter, configurable: true }); } catch (e) {}
         };
         defProp(navProto, 'userAgent', () => FP.ua);
         defProp(navProto, 'appVersion', () => FP.ua.replace('Mozilla/', ''));
@@ -514,7 +520,6 @@ function buildStealthScript(fp) {
         defProp(navProto, 'maxTouchPoints', () => 0);
         defProp(navProto, 'webdriver', () => undefined);
 
-        // ═══════════ Plugins (real objects) ═══════════
         try {
             const mkMime = (type, suffixes, desc) => {
                 const m = Object.create(MimeType.prototype);
@@ -551,18 +556,16 @@ function buildStealthScript(fp) {
             defProp(navProto, 'plugins', () => arr);
         } catch (e) {}
 
-        // ═══════════ Screen ═══════════
-        const sp = Screen.prototype;
-        defProp(sp, 'width', () => FP.screen.width);
-        defProp(sp, 'height', () => FP.screen.height);
-        defProp(sp, 'availWidth', () => FP.screen.width);
-        defProp(sp, 'availHeight', () => FP.screen.availHeight);
-        defProp(sp, 'colorDepth', () => FP.colorDepth);
-        defProp(sp, 'pixelDepth', () => FP.colorDepth);
+        try {
+            const sp = Screen.prototype;
+            defProp(sp, 'width', () => FP.screen.width);
+            defProp(sp, 'height', () => FP.screen.height);
+            defProp(sp, 'availWidth', () => FP.screen.width);
+            defProp(sp, 'availHeight', () => FP.screen.availHeight);
+            defProp(sp, 'colorDepth', () => FP.colorDepth);
+            defProp(sp, 'pixelDepth', () => FP.colorDepth);
+        } catch (e) {}
 
-        // ═══════════ WebGL — INSTANCE LEVEL ═══════════
-        // Most aggressive: hook at getContext level so every WebGL instance
-        // returns our fingerprint, regardless of how it's created.
         try {
             const patchCtx = (ctx) => {
                 if (!ctx) return ctx;
@@ -576,8 +579,7 @@ function buildStealthScript(fp) {
                             if (p === 7937) return 'WebKit WebGL';
                             return origGetParam(p);
                         },
-                        writable: false,
-                        configurable: false
+                        writable: false, configurable: false
                     });
                 } catch (e) {}
                 return ctx;
@@ -590,7 +592,6 @@ function buildStealthScript(fp) {
                 }
                 return ctx;
             };
-            // Also patch prototype for safety
             if (window.WebGLRenderingContext) {
                 const gp = WebGLRenderingContext.prototype.getParameter;
                 WebGLRenderingContext.prototype.getParameter = function (p) {
@@ -613,12 +614,10 @@ function buildStealthScript(fp) {
             }
         } catch (e) {}
 
-        // ═══════════ Canvas Noise (fingerprint defense) ═══════════
         try {
             const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
             CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
                 const imgData = origGetImageData.call(this, x, y, w, h);
-                // Add subtle noise to 0.01% of pixels
                 const data = imgData.data;
                 const pixelCount = data.length / 4;
                 const noiseCount = Math.max(1, Math.floor(pixelCount * 0.0001));
@@ -628,15 +627,8 @@ function buildStealthScript(fp) {
                 }
                 return imgData;
             };
-            if (CanvasRenderingContext2D.prototype.toDataURL) {
-                const origToDataURL = CanvasRenderingContext2D.prototype.toDataURL;
-                CanvasRenderingContext2D.prototype.toDataURL = function (...args) {
-                    return origToDataURL.apply(this, args);
-                };
-            }
         } catch (e) {}
 
-        // ═══════════ Timezone ═══════════
         try {
             const origResolved = Intl.DateTimeFormat.prototype.resolvedOptions;
             Intl.DateTimeFormat.prototype.resolvedOptions = function () {
@@ -647,7 +639,6 @@ function buildStealthScript(fp) {
             Date.prototype.getTimezoneOffset = function () { return FP.tzOffset; };
         } catch (e) {}
 
-        // ═══════════ Permissions ═══════════
         try {
             if (navigator.permissions && navigator.permissions.query) {
                 const oq = navigator.permissions.query.bind(navigator.permissions);
@@ -658,7 +649,6 @@ function buildStealthScript(fp) {
             }
         } catch (e) {}
 
-        // ═══════════ Chrome runtime ═══════════
         try {
             window.chrome = window.chrome || {};
             window.chrome.runtime = window.chrome.runtime || {};
@@ -667,7 +657,6 @@ function buildStealthScript(fp) {
             window.chrome.loadTimes = () => ({ commitLoadTime: Date.now()/1000, finishLoadTime: Date.now()/1000, navigationType: 'Other' });
         } catch (e) {}
 
-        // ═══════════ WebRTC leak ═══════════
         try {
             const oRTC = window.RTCPeerConnection;
             window.RTCPeerConnection = function (cfg) {
@@ -676,7 +665,6 @@ function buildStealthScript(fp) {
             };
         } catch (e) {}
 
-        // ═══════════ Battery ═══════════
         try {
             if (navigator.getBattery) {
                 navigator.getBattery = () => Promise.resolve({
@@ -715,7 +703,6 @@ function makeBehaviorEngine(log) {
         }
         mouseX = tx; mouseY = ty;
     }
-
     async function scrollDown(page, dy) {
         const chunks = randInt(3, 6);
         for (let i = 0; i < chunks; i++) {
@@ -924,7 +911,6 @@ async function runOneBot(botId, fingerprint, options = {}) {
     const ok  = (m) => LOG.ok(tag, m);
     const err = (m) => LOG.error(tag, m);
 
-    // Choose referrer
     const refSrc = referrerSource || pickReferrerSource();
 
     log(`Fingerprint: ${fingerprint.name}`);
@@ -963,25 +949,20 @@ async function runOneBot(botId, fingerprint, options = {}) {
             proxy: proxyConfig
         });
 
-        // Stealth script on context (applies to all future pages)
         await context.addInitScript(buildStealthScript(fingerprint));
-
         page = await context.newPage();
-        // Also apply to current page
         await page.addInitScript(buildStealthScript(fingerprint));
 
         page.on("framenavigated", f => {
             if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 80)}`);
         });
 
-        // ⭐ Navigate with referrer
         const gotoOpts = { waitUntil: "domcontentloaded", timeout: 60000 };
         if (refSrc.referer) gotoOpts.referer = refSrc.referer;
 
         await page.goto(CFG.targetUrl, gotoOpts);
         log(`Loaded homepage via ${refSrc.name}`);
 
-        // Verify fingerprint
         const liveFp = await page.evaluate(() => ({
             wd: navigator.webdriver,
             plugins: navigator.plugins.length,
@@ -1002,16 +983,14 @@ async function runOneBot(botId, fingerprint, options = {}) {
         log(`  GPU: ${liveFp.gpu}`);
         log(`  Ref: ${liveFp.ref.substring(0, 70)}`);
 
-        // ⭐ Session variance: bounce / reader / engaged
         const sessionType = (() => {
             const r = rng();
-            if (r < 0.25) return 'bounce';   // 25%: quick bounce
-            if (r < 0.85) return 'reader';   // 60%: normal reader
-            return 'engaged';                // 15%: deep engagement
+            if (r < 0.25) return 'bounce';
+            if (r < 0.85) return 'reader';
+            return 'engaged';
         })();
         log(`  Session type: ${sessionType}`);
 
-        // Homepage browsing
         await B.microMoves(page, sessionType === 'bounce' ? 1 : 2);
         await B.pause(page, 150, 350);
         await B.scrollDown(page, randInt(
@@ -1029,19 +1008,17 @@ async function runOneBot(botId, fingerprint, options = {}) {
         }
         if (cards.length === 0) { log("  No cards — aborting"); return { status: 'no_cards', sessionType }; }
 
-        // Plan
         let plan;
         if (sessionType === 'bounce') {
             plan = rng() < 0.6 ? 'single-exit' : 'single-return';
         } else if (sessionType === 'reader') {
             const r = rng();
             plan = r < 0.5 ? 'single-exit' : (r < 0.85 ? 'single-return' : 'double');
-        } else { // engaged
+        } else {
             plan = rng() < 0.5 ? 'double' : 'single-return';
         }
         log(`  Plan: ${plan}`);
 
-        // Choose games
         const firstIdx = randInt(0, Math.min(cards.length - 1, 5));
         const first = cards[firstIdx];
         const ok1 = await clickGame(page, first.href, B, log);
@@ -1053,7 +1030,6 @@ async function runOneBot(botId, fingerprint, options = {}) {
             }
         }
 
-        // Post-page behavior
         if (/\/\d{4}\/\d{2}\//.test(page.url())) {
             const dwellSec = sessionType === 'bounce'
                 ? randInt(3, 7)
@@ -1074,7 +1050,6 @@ async function runOneBot(botId, fingerprint, options = {}) {
             }
         }
 
-        // Second game (double plan)
         if (plan === 'double' && page.url().includes('blogspot.com') && !/\/\d{4}\/\d{2}\//.test(page.url())) {
             await B.pause(page, 500, 1200);
             await B.scrollDown(page, randInt(150, 320));
@@ -1116,7 +1091,7 @@ async function runOneBot(botId, fingerprint, options = {}) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   ⏰  Poisson Scheduler with double jitter
+   ⏰  Poisson Scheduler
    ═══════════════════════════════════════════════════════════════ */
 
 function poissonTimes(count, windowMs) {
@@ -1132,7 +1107,7 @@ function poissonTimes(count, windowMs) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🗂️  State (persistent across cron runs)
+   🗂️  State
    ═══════════════════════════════════════════════════════════════ */
 
 class State {
@@ -1181,7 +1156,7 @@ async function runSingle() {
     }
     if (!proxyGeo) proxyGeo = await detectGeo(null);
 
-    if (CFG.geoStrict && !proxyGeo) {
+    if (!proxyGeo) {
         LOG.error('MAIN', 'GEO_STRICT: cannot determine IP — aborting');
         return { status: 'aborted_no_geo' };
     }
@@ -1210,21 +1185,28 @@ async function runParallel() {
     const running = new Set();
 
     async function launchBot(id) {
-        // Small random delay before each bot (avoid simultaneous starts)
         await sleep(randInt(0, 3000));
 
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
         const geo = await getGeo(proxy);
         if (proxy) pool.markUsed(proxy);
 
-        if (CFG.geoStrict && !geo) {
+        if (!geo) {
             LOG.warn('MAIN', `Bot ${id}: no geo — skipping`);
             results.push({ id, status: 'no_geo' });
             return;
         }
 
         const baseFp = BASE_FINGERPRINTS[(id - 1) % BASE_FINGERPRINTS.length];
-        const fp = buildFingerprintForGeo(baseFp, geo);
+        let fp;
+        try {
+            fp = buildFingerprintForGeo(baseFp, geo);
+        } catch (e) {
+            LOG.warn('MAIN', `Bot ${id}: ${e.message} — skipping`);
+            results.push({ id, status: 'no_geo_strict' });
+            return;
+        }
+
         const res = await runOneBot(id, fp, { proxy, proxyGeo: geo });
         results.push({ id, ...res });
     }
@@ -1248,13 +1230,20 @@ async function runSequential() {
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
         let geo = proxy ? await detectGeo(proxy) : await detectGeo(null);
         if (proxy) pool.markUsed(proxy);
-        if (CFG.geoStrict && !geo) {
+        if (!geo) {
             LOG.warn('MAIN', `Bot ${i}: no geo — skipping`);
             results.push({ id: i, status: 'no_geo' });
             continue;
         }
         const baseFp = BASE_FINGERPRINTS[(i - 1) % BASE_FINGERPRINTS.length];
-        const fp = buildFingerprintForGeo(baseFp, geo);
+        let fp;
+        try {
+            fp = buildFingerprintForGeo(baseFp, geo);
+        } catch (e) {
+            LOG.warn('MAIN', `Bot ${i}: ${e.message} — skipping`);
+            results.push({ id: i, status: 'no_geo_strict' });
+            continue;
+        }
         const res = await runOneBot(i, fp, { proxy, proxyGeo: geo });
         results.push({ id: i, ...res });
 
@@ -1279,18 +1268,23 @@ async function runDistributed() {
     const tasks = times.map((offset, idx) => (async () => {
         const wait = offset - (Date.now() - t0);
         if (wait > 0) await sleep(wait);
-        // Extra jitter (0-90s) to avoid synchronized starts
         await sleep(randInt(0, 90000));
 
         const proxy = pool.isEmpty() ? null : pool.pickLeastUsed();
         let geo = proxy ? await detectGeo(proxy) : await detectGeo(null);
         if (proxy) pool.markUsed(proxy);
-        if (CFG.geoStrict && !geo) {
+        if (!geo) {
             results.push({ id: idx + 1, status: 'no_geo' });
             return;
         }
         const baseFp = BASE_FINGERPRINTS[idx % BASE_FINGERPRINTS.length];
-        const fp = buildFingerprintForGeo(baseFp, geo);
+        let fp;
+        try {
+            fp = buildFingerprintForGeo(baseFp, geo);
+        } catch (e) {
+            results.push({ id: idx + 1, status: 'no_geo_strict' });
+            return;
+        }
         const res = await runOneBot(idx + 1, fp, { proxy, proxyGeo: geo });
         results.push({ id: idx + 1, ...res });
     })());
@@ -1303,7 +1297,6 @@ async function runCampaign() {
     LOG.info('MAIN', `Campaign: ${CFG.botCount} bots over ${CFG.windowMinutes}m`);
     const windowMs = CFG.windowMinutes * 60 * 1000;
 
-    // Generate waves with varying sizes
     const waves = [];
     let remaining = CFG.botCount;
     while (remaining > 0) {
@@ -1313,7 +1306,6 @@ async function runCampaign() {
     }
     LOG.info('MAIN', `Waves: ${waves.join(' + ')} = ${waves.reduce((a, b) => a + b, 0)}`);
 
-    // Poisson times for wave starts
     const waveStarts = poissonTimes(waves.length, windowMs * 0.80);
     const t0 = Date.now();
     const results = [];
@@ -1324,7 +1316,6 @@ async function runCampaign() {
             LOG.info('MAIN', `Waiting ${(wait / 60000).toFixed(1)}m for wave ${wi + 1}`);
             await sleep(wait);
         }
-        // Random jitter (0-60s) before wave
         await sleep(randInt(0, 60000));
 
         LOG.info('MAIN', `▶ Wave ${wi + 1}/${waves.length}: ${waves[wi]} bots`);
@@ -1383,7 +1374,7 @@ async function runAuto() {
 
 function printBanner() {
     console.log("╔══════════════════════════════════════════════════════╗");
-    console.log("║  BLOGGER BOT DETECTION LAB v3.1 — Geo-Strict        ║");
+    console.log("║  BLOGGER BOT DETECTION LAB v3.2 — Geo-Strict Locked ║");
     console.log("╚══════════════════════════════════════════════════════╝");
     console.log(`  Run ID:        ${RUN_ID}`);
     console.log(`  Target:        ${CFG.targetUrl}`);
@@ -1419,7 +1410,8 @@ async function main() {
             default:            summary = await runSingle();
         }
         const okCount = (summary?.results || []).filter(r => r.status === 'ok').length;
-        LOG.ok('MAIN', `Done in ${Math.round((Date.now() - START_TS) / 1000)}s | OK: ${okCount}`);
+        const skipCount = (summary?.results || []).filter(r => r.status && r.status.startsWith('no_geo')).length;
+        LOG.ok('MAIN', `Done in ${Math.round((Date.now() - START_TS) / 1000)}s | OK: ${okCount} | Skipped (no_geo): ${skipCount}`);
     } catch (e) {
         LOG.error('MAIN', `Fatal: ${e.message}`);
         process.exitCode = 1;
