@@ -1,18 +1,27 @@
 name: Bot Detection Lab
 
-# ═════════════════════════════════════════════════════════════════
-#  نظامين فقط:
-#   1) Manual: اختبار يدوي (single bots متتالية من IP واحد — للاختبار فقط)
-#   2) Matrix: الإنتاج التلقائي (12 runner = 12 IP مختلف كل 15 دقيقة)
-# ═════════════════════════════════════════════════════════════════
 on:
   workflow_dispatch:
     inputs:
-      count:
-        description: 'عدد البوتات للاختبار اليدوي (1-10)'
+      matrix_count:
+        description: 'Matrix bots count (1-12)'
+        required: true
+        default: '12'
+        type: choice
+        options:
+          - '4'
+          - '6'
+          - '8'
+          - '12'
+      max_parallel:
+        description: 'Max concurrent runners'
         required: true
         default: '3'
-        type: string
+        type: choice
+        options:
+          - '2'
+          - '3'
+          - '4'
 
   # الإنتاج — كل 15 دقيقة
   schedule:
@@ -22,88 +31,24 @@ permissions:
   contents: read
   actions: read
 
-# ═════════════════════════════════════════════════════════════════
 jobs:
-
   # ═══════════════════════════════════════════════════════════════
-  # Manual Test — للاختبار فقط (يدوي من GitHub UI)
-  # ═══════════════════════════════════════════════════════════════
-  manual-test:
-    name: Manual Test
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    concurrency:
-      group: bot-manual
-      cancel-in-progress: false
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: Install npm packages
-        run: npm install
-
-      - name: Install Patchright Chromium
-        run: npx patchright install --with-deps chromium
-
-      - name: Run sequential bots (for testing only)
-        env:
-          TARGET_URL: 'https://pog01.blogspot.com/'
-          MAX_DURATION_MINUTES: '10'
-          HEADLESS: 'true'
-          SCREENSHOTS: 'false'
-          GEO_STRICT: 'true'
-        run: |
-          COUNT=${{ github.event.inputs.count }}
-          for i in $(seq 1 $COUNT); do
-            echo ""
-            echo "════════════════════════════════════════"
-            echo "  Bot $i of $COUNT"
-            echo "════════════════════════════════════════"
-            BOT_MODE=single \
-            BOT_ID=$i \
-            BOT_COUNT=1 \
-            STATE_DIR=.bot-state-manual-$i \
-            GEO_CACHE_DIR=.geo-cache-manual-$i \
-            npm test || true
-
-            if [ $i -lt $COUNT ]; then
-              GAP=$((RANDOM % 60 + 30))
-              echo "Waiting ${GAP}s before next bot..."
-              sleep $GAP
-            fi
-          done
-
-      - name: Upload manual artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: manual-evidence-${{ github.run_id }}
-          path: .bot-state-manual-*/
-          retention-days: 1
-          if-no-files-found: ignore
-
-  # ═══════════════════════════════════════════════════════════════
-  # Matrix — الإنتاج الرئيسي (12 runner = 12 IP مختلف)
+  # Matrix — يعمل يدوياً + تلقائياً
   # ═══════════════════════════════════════════════════════════════
   matrix-bots:
     name: Bot ${{ matrix.bot_id }}
-    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    concurrency:
-      group: bot-matrix
-      cancel-in-progress: false
 
     strategy:
       fail-fast: false
-      max-parallel: 3        # ← 3 متزامنة، 9 في الانتظار
+      # عند اليدوي: استخدم max_parallel المختار
+      # عند Cron: استخدم 3 دائماً
+      max-parallel: ${{ github.event_name == 'workflow_dispatch' && fromJSON(github.event.inputs.max_parallel) || 3 }}
       matrix:
-        bot_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        # عند اليدوي: 1..matrix_count
+        # عند Cron: 1..12
+        bot_id: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('[{0}]', join(range(1, fromJSON(github.event.inputs.matrix_count) + 1), ','))) || fromJSON('[1,2,3,4,5,6,7,8,9,10,11,12]') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -118,12 +63,18 @@ jobs:
       - name: Install Patchright Chromium
         run: npx patchright install --with-deps chromium
 
-      # ⭐ تأخير عشوائي مختلف لكل بوت — يمنع التزامن الجماعي
+      # تأخير عشوائي مختلف لكل بوت
       - name: Random jitter
         run: |
           JITTER=$(( (RANDOM + ${{ matrix.bot_id }} * 73) % 240 ))
-          echo "Bot ${{ matrix.bot_id }} will start after ${JITTER}s"
+          echo "Bot ${{ matrix.bot_id }} starting in ${JITTER}s..."
           sleep $JITTER
+
+      - name: Show environment
+        run: |
+          echo "Bot ID: ${{ matrix.bot_id }}"
+          echo "Runner: ${{ runner.name }}"
+          echo "Triggered by: ${{ github.event_name }}"
 
       - name: Run bot ${{ matrix.bot_id }}
         env:
@@ -143,4 +94,22 @@ jobs:
           GEO_STRICT: 'true'
           STATE_DIR: '.bot-state-${{ matrix.bot_id }}'
           GEO_CACHE_DIR: '.geo-cache-${{ matrix.bot_id }}'
-        run: npm test
+        run: |
+          echo "════════════════════════════════════════"
+          echo "  Starting BOT ${{ matrix.bot_id }}"
+          echo "════════════════════════════════════════"
+          npm test
+          echo "════════════════════════════════════════"
+          echo "  BOT ${{ matrix.bot_id }} DONE"
+          echo "════════════════════════════════════════"
+
+      - name: Upload artifacts if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-${{ matrix.bot_id }}-error-${{ github.run_id }}
+          path: |
+            screenshots/
+            .bot-state-${{ matrix.bot_id }}/
+          retention-days: 2
+          if-no-files-found: ignore
