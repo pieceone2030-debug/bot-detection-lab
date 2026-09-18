@@ -1,12 +1,11 @@
 /**
- * Bot Detection Lab v3.2 — Geo-Strict Locked Edition
+ * Bot Detection Lab v3.3 — Randomized Timing Edition
  * ─────────────────────────────────────────────────────────────
- * Fixes in v3.2:
- *   • detectGeo: requires timezone from IP (no null fallback)
- *   • buildFingerprintForGeo: throws if no valid timezone
- *   • launchBot: skips bot if no geo instead of using random TZ
- *   • Added ipinfo.io as 3rd API fallback
- *   • Cache validation requires timezone field
+ * Fixes in v3.3 (based on AI analysis feedback):
+ *   • Removed fixed 10s pattern (dwell times now 3-50s)
+ *   • Homepage thinking time now varies 2-15s
+ *   • Expanded target articles (all cards, not just first 6)
+ *   • Added 3 more US timezones (Detroit, Indianapolis, Boise)
  * ─────────────────────────────────────────────────────────────
  */
 'use strict';
@@ -40,8 +39,8 @@ const CFG = {
     maxDurationMin:   intEnv("MAX_DURATION_MINUTES", 55),
     headless:         envBool("HEADLESS",           true),
     screenshots:      envBool("SCREENSHOTS",        true),
-    dwellMin:         intEnv("DWELL_MIN",           12),
-    dwellMax:         intEnv("DWELL_MAX",           17),
+    dwellMin:         intEnv("DWELL_MIN",           8),
+    dwellMax:         intEnv("DWELL_MAX",           22),
     stateDir:         process.env.STATE_DIR         || ".bot-state",
     cronMinGapMin:    intEnv("CRON_MIN_GAP_MINUTES", 20),
     geoStrict:        envBool("GEO_STRICT",         true),
@@ -173,11 +172,24 @@ const BASE_FINGERPRINTS = [
 ];
 
 /* ═══════════════════════════════════════════════════════════════
-   🌍  Geo Profiles
+   🌍  Geo Profiles — MODIFICATION 4: Added 3 more US timezones
    ═══════════════════════════════════════════════════════════════ */
 
 const GEO_PROFILES = {
-    'US': { locale: 'en-US', languages: ['en-US', 'en'], timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Phoenix'] },
+    'US': {
+        locale: 'en-US',
+        languages: ['en-US', 'en'],
+        timezones: [
+            'America/New_York',
+            'America/Chicago',
+            'America/Denver',
+            'America/Los_Angeles',
+            'America/Phoenix',
+            'America/Detroit',
+            'America/Indiana/Indianapolis',
+            'America/Boise'
+        ]
+    },
     'CA': { locale: 'en-CA', languages: ['en-CA', 'en', 'fr'], timezones: ['America/Toronto', 'America/Vancouver'] },
     'GB': { locale: 'en-GB', languages: ['en-GB', 'en'], timezones: ['Europe/London'] },
     'DE': { locale: 'de-DE', languages: ['de-DE', 'de', 'en'], timezones: ['Europe/Berlin'] },
@@ -207,11 +219,15 @@ const GEO_PROFILES = {
     'UA': { locale: 'uk-UA', languages: ['uk-UA', 'uk', 'ru', 'en'], timezones: ['Europe/Kiev'] }
 };
 
+/* MODIFICATION 4b: Added offsets for new timezones */
 const TZ_OFFSETS = {
     'America/New_York': 300, 'America/Chicago': 360, 'America/Denver': 420,
     'America/Phoenix': 420, 'America/Los_Angeles': 480, 'America/Toronto': 300,
     'America/Vancouver': 480, 'America/Mexico_City': 360, 'America/Sao_Paulo': 180,
     'America/Argentina/Buenos_Aires': 180,
+    'America/Detroit': 300,
+    'America/Indiana/Indianapolis': 300,
+    'America/Boise': 420,
     'Europe/London': 0, 'Europe/Berlin': -60, 'Europe/Paris': -60, 'Europe/Madrid': -60,
     'Europe/Rome': -60, 'Europe/Warsaw': -60, 'Europe/Amsterdam': -60,
     'Europe/Moscow': -180, 'Europe/Istanbul': -180, 'Europe/Kiev': -120,
@@ -301,7 +317,7 @@ function parseProxyLines(text) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🌍  ROBUST Geo Detection — v3.2 STRICT
+   🌍  Robust Geo Detection
    ═══════════════════════════════════════════════════════════════ */
 
 function geoCacheKey(proxy) {
@@ -316,8 +332,7 @@ function loadGeocache(proxy) {
         if (!fs.existsSync(file)) return null;
         const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (Date.now() - entry.ts > 6 * 3600 * 1000) return null;
-        // ⚠️ STRICT: cache must contain timezone
-        if (!entry.geo || !entry.geo.timezone) return null;
+        if (!entry.geo || !entry.geo.timezone || typeof entry.geo.timezone !== 'string') return null;
         return entry.geo;
     } catch (e) { return null; }
 }
@@ -333,7 +348,7 @@ function saveGeocache(proxy, geo) {
 
 async function detectGeo(proxy) {
     const cached = loadGeocache(proxy);
-    if (cached && cached.timezone && typeof cached.timezone === 'string' && TZ_OFFSETS[cached.timezone] !== undefined) {
+    if (cached && cached.timezone && TZ_OFFSETS[cached.timezone] !== undefined) {
         LOG.info('GEO', `Cache hit → ${cached.city}, ${cached.country} (${cached.timezone})`);
         return cached;
     }
@@ -368,7 +383,7 @@ async function detectGeo(proxy) {
                 });
                 if (!raw || !raw.ip) continue;
 
-                // ⭐ Reset before each API
+                // Reset before each API
                 ip = raw.ip;
                 country = null;
                 timezone = null;
@@ -376,7 +391,7 @@ async function detectGeo(proxy) {
                 org = null;
                 asn = null;
 
-                // ─── ipapi.co ───
+                // ipapi.co
                 if (raw.country_code !== undefined && typeof raw.timezone === 'string') {
                     country = (raw.country_code || '').toUpperCase();
                     timezone = raw.timezone;
@@ -385,10 +400,9 @@ async function detectGeo(proxy) {
                     asn = raw.asn;
                     source = 'ipapi';
                 }
-                // ─── ipwho.is ─── (note: it also has country_code!)
+                // ipwho.is (timezone is an object)
                 else if (raw.success === true) {
                     country = (raw.country_code || '').toUpperCase();
-                    // timezone is an OBJECT — extract .id
                     if (raw.timezone) {
                         timezone = typeof raw.timezone === 'string'
                             ? raw.timezone
@@ -399,15 +413,15 @@ async function detectGeo(proxy) {
                     asn = raw.connection && raw.connection.asn;
                     source = 'ipwho';
                 }
-                // ─── ipinfo.io ───
-                else if (raw.country !== undefined) {
+                // ipinfo.io
+                else if (raw.country !== undefined && raw.country.length === 2) {
                     country = (raw.country || '').toUpperCase();
                     timezone = typeof raw.timezone === 'string' ? raw.timezone : null;
                     city = raw.city;
                     org = raw.org;
                     source = 'ipinfo';
                 }
-                // ─── ifconfig.co ───
+                // ifconfig.co
                 else if (raw.country_iso !== undefined) {
                     country = (raw.country_iso || '').toUpperCase();
                     timezone = typeof raw.time_zone === 'string' ? raw.time_zone : null;
@@ -415,12 +429,12 @@ async function detectGeo(proxy) {
                     source = 'ifconfig';
                 }
 
-                // Normalize: ensure timezone is a string, never an object
+                // Normalize timezone
                 if (timezone && typeof timezone === 'object') {
                     timezone = timezone.id || timezone.name || null;
                 }
 
-                // ⚠️ STRICT: must have country + timezone
+                // Must have country + timezone
                 if (!country || !timezone) {
                     LOG.warn('GEO', `${source} returned no timezone — trying next API`);
                     ip = null; country = null; timezone = null;
@@ -434,7 +448,6 @@ async function detectGeo(proxy) {
                     continue;
                 }
 
-                // ✅ Success
                 break;
             } catch (e) {
                 continue;
@@ -467,19 +480,18 @@ async function detectGeo(proxy) {
         if (browser) await browser.close().catch(() => {});
     }
 }
+
 /* ═══════════════════════════════════════════════════════════════
-   🧬  Build fingerprint — v3.2 HARD TZ LOCK
+   🧬  Build fingerprint (HARD TZ LOCK)
    ═══════════════════════════════════════════════════════════════ */
 
 function buildFingerprintForGeo(baseFp, geo, options = {}) {
     const { requireGeo = CFG.geoStrict } = options;
 
-    // ⚠️ STRICT: throw if no valid timezone — prevents TZ mismatch
     if (!geo || !geo.timezone || TZ_OFFSETS[geo.timezone] === undefined) {
         if (requireGeo) {
             throw new Error('GEO_STRICT: missing valid timezone from IP');
         }
-        // Non-strict fallback (only if explicitly disabled)
         LOG.warn('FP', 'NON-STRICT fallback: using America/New_York');
         geo = { country: 'US', timezone: 'America/New_York' };
     }
@@ -487,7 +499,7 @@ function buildFingerprintForGeo(baseFp, geo, options = {}) {
     const fp = JSON.parse(JSON.stringify(baseFp));
     const profile = pickGeoProfile(geo.country);
 
-    // ⭐ HARD LOCK: timezone comes ONLY from IP
+    // HARD LOCK: timezone from IP
     fp.timezone = geo.timezone;
     fp.locale = profile.locale;
     fp.languages = [...profile.languages];
@@ -925,7 +937,7 @@ async function exitToGame(page, B, log) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🎬  Session Runner
+   🎬  Session Runner — MODIFICATIONS 1, 2, 3 applied
    ═══════════════════════════════════════════════════════════════ */
 
 async function runOneBot(botId, fingerprint, options = {}) {
@@ -1005,7 +1017,6 @@ async function runOneBot(botId, fingerprint, options = {}) {
         }));
         log(`  CHECK: wd=${liveFp.wd}, plugins=${liveFp.plugins}, tz=${liveFp.tz}`);
         log(`  GPU: ${liveFp.gpu}`);
-        log(`  Ref: ${liveFp.ref.substring(0, 70)}`);
 
         const sessionType = (() => {
             const r = rng();
@@ -1015,13 +1026,18 @@ async function runOneBot(botId, fingerprint, options = {}) {
         })();
         log(`  Session type: ${sessionType}`);
 
-        await B.microMoves(page, sessionType === 'bounce' ? 1 : 2);
-        await B.pause(page, 150, 350);
+        // ⭐ MODIFICATION 3: Homepage thinking time (2-15s)
+        const homeThink = randInt(2000, 15000);
+        log(`  Thinking on homepage for ${(homeThink / 1000).toFixed(1)}s...`);
+        await B.microMoves(page, randInt(1, 4));
+        await page.waitForTimeout(homeThink);
+
+        // Light scroll activity
         await B.scrollDown(page, randInt(
             sessionType === 'bounce' ? 100 : 200,
             sessionType === 'engaged' ? 600 : 380
         ));
-        await B.pause(page, 250, 550);
+        await B.pause(page, 400, 900);
 
         let cards = await findCards(page);
         log(`  Cards found: ${cards.length}`);
@@ -1043,21 +1059,29 @@ async function runOneBot(botId, fingerprint, options = {}) {
         }
         log(`  Plan: ${plan}`);
 
-        const firstIdx = randInt(0, Math.min(cards.length - 1, 5));
+        // ⭐ MODIFICATION 1: Pick from ALL cards (not just first 6)
+        const firstIdx = randInt(0, cards.length - 1);
         const first = cards[firstIdx];
         const ok1 = await clickGame(page, first.href, B, log);
         if (!ok1) {
             await B.pause(page, 800, 1500);
             if (!/\/\d{4}\/\d{2}\//.test(page.url()) && cards.length > 1) {
-                const alt = cards[randInt(0, Math.min(cards.length - 1, 5))];
+                const alt = cards[randInt(0, cards.length - 1)];
                 await clickGame(page, alt.href, B, log);
             }
         }
 
+        // ⭐ MODIFICATION 2: More varied dwell times
         if (/\/\d{4}\/\d{2}\//.test(page.url())) {
-            const dwellSec = sessionType === 'bounce'
-                ? randInt(3, 7)
-                : (sessionType === 'engaged' ? randInt(15, 25) : randInt(CFG.dwellMin, CFG.dwellMax));
+            let dwellSec;
+            if (sessionType === 'bounce') {
+                dwellSec = randInt(3, 10);          // 3-10s (quick bounce)
+            } else if (sessionType === 'engaged') {
+                dwellSec = randInt(25, 50);         // 25-50s (long reader)
+            } else {
+                dwellSec = randInt(8, 22);          // 8-22s (normal reader)
+            }
+            log(`  Dwell target: ${dwellSec}s (type: ${sessionType})`);
 
             await dwellOnPost(page, dwellSec, B, log);
 
@@ -1074,6 +1098,7 @@ async function runOneBot(botId, fingerprint, options = {}) {
             }
         }
 
+        // Second game for 'double' plan
         if (plan === 'double' && page.url().includes('blogspot.com') && !/\/\d{4}\/\d{2}\//.test(page.url())) {
             await B.pause(page, 500, 1200);
             await B.scrollDown(page, randInt(150, 320));
@@ -1081,9 +1106,9 @@ async function runOneBot(botId, fingerprint, options = {}) {
             const fresh = await findCards(page);
             const remaining = fresh.filter(c => c.href !== first.href);
             if (remaining.length) {
-                const second = remaining[randInt(0, Math.min(remaining.length - 1, 5))];
+                const second = remaining[randInt(0, remaining.length - 1)];
                 if (await clickGame(page, second.href, B, log)) {
-                    const dwellSec = randInt(CFG.dwellMin, CFG.dwellMax);
+                    const dwellSec = randInt(8, 22);
                     await dwellOnPost(page, dwellSec, B, log);
                     const left = await exitToGame(page, B, log);
                     if (!left) { try { await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (e) {} }
@@ -1170,6 +1195,7 @@ class State {
 /* ═══════════════════════════════════════════════════════════════
    🎭  Orchestrators
    ═══════════════════════════════════════════════════════════════ */
+
 async function runSingle() {
     const pool = ProxyPool.fromEnv();
     let proxy = null, proxyGeo = null;
@@ -1184,7 +1210,6 @@ async function runSingle() {
         return { status: 'aborted_no_geo' };
     }
 
-    // ⭐ BOT_ID يحدد البصمة بشكل حتمي (لتفادي التصادم في matrix)
     const botNum = parseInt(CFG.botId, 10) || 1;
     const idx = (botNum - 1) % BASE_FINGERPRINTS.length;
     const baseFp = BASE_FINGERPRINTS[idx];
@@ -1403,7 +1428,7 @@ async function runAuto() {
 
 function printBanner() {
     console.log("╔══════════════════════════════════════════════════════╗");
-    console.log("║  BLOGGER BOT DETECTION LAB v3.2 — Geo-Strict Locked ║");
+    console.log("║  BLOGGER BOT DETECTION LAB v3.3 — Randomized        ║");
     console.log("╚══════════════════════════════════════════════════════╝");
     console.log(`  Run ID:        ${RUN_ID}`);
     console.log(`  Target:        ${CFG.targetUrl}`);
