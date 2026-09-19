@@ -1,21 +1,22 @@
 {
   "name": "bot-detection-lab",
-  "version": "3.1.0",
+  "version": "3.4.0",
   "private": true,
   "scripts": {
-    "start":           "node bot-test.js",
-    "test":            "node bot-test.js",
-    "run:single":      "BOT_MODE=single node bot-test.js",
-    "run:parallel":    "BOT_MODE=parallel BOT_COUNT=6 PARALLELISM=3 node bot-test.js",
-    "run:sequential":  "BOT_MODE=sequential BOT_COUNT=6 node bot-test.js",
+    "start": "node bot-test.js",
+    "test": "node bot-test.js",
+    "run:single": "BOT_MODE=single node bot-test.js",
+    "run:parallel": "BOT_MODE=parallel BOT_COUNT=6 PARALLELISM=3 node bot-test.js",
+    "run:sequential": "BOT_MODE=sequential BOT_COUNT=6 node bot-test.js",
     "run:distributed": "BOT_MODE=distributed BOT_COUNT=12 WINDOW_MINUTES=30 node bot-test.js",
-    "run:campaign":    "BOT_MODE=campaign BOT_COUNT=20 WINDOW_MINUTES=60 node bot-test.js",
-    "run:auto":        "BOT_MODE=auto node bot-test.js"
+    "run:campaign": "BOT_MODE=campaign BOT_COUNT=20 WINDOW_MINUTES=60 node bot-test.js",
+    "run:auto": "BOT_MODE=auto node bot-test.js"
   },
   "dependencies": {
     "patchright": "^1.62.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "@zorilla/puppeteer-extra-plugin-anonymize-ua": "^2.0.1"
+    "@zorilla/puppeteer-extra-plugin-anonymize-ua": "^2.0.1",
+    "@ghostery/adblocker-playwright": "^2.5.0"
   }
 }
