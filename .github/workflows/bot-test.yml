@@ -3,21 +3,36 @@ name: Bot Detection Lab
 on:
   workflow_dispatch:
     inputs:
-      matrix_count:
+      mode:
+        description: 'Mode'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - single
+          - parallel
+          - sequential
+          - distributed
+          - campaign
+          - auto
+      count:
         description: 'Bots count'
         required: true
-        default: '20'
-        type: choice
-        options: ['12', '16', '20', '24']
-      max_parallel:
-        description: 'Max parallel'
+        default: '12'
+        type: string
+      parallelism:
+        description: 'Concurrent bots'
         required: true
-        default: '5'
-        type: choice
-        options: ['3', '5', '6']
+        default: '3'
+        type: string
+      window:
+        description: 'Window in minutes'
+        required: true
+        default: '30'
+        type: string
 
   schedule:
-    - cron: '*/6 * * * *'
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
@@ -31,18 +46,18 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: ${{ github.event_name == 'workflow_dispatch' && fromJSON(github.event.inputs.max_parallel) || 5 }}
+      max-parallel: ${{ github.event_name == 'workflow_dispatch' && fromJSON(github.event.inputs.parallelism) || 3 }}
       matrix:
-        bot_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+        bot_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 
     steps:
-      - name: Check if should run
+      - name: Gate check
         id: gate
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            LIMIT=${{ github.event.inputs.matrix_count }}
+            LIMIT=${{ github.event.inputs.count }}
           else
-            LIMIT=20
+            LIMIT=12
           fi
           if [ ${{ matrix.bot_id }} -le $LIMIT ]; then
             echo "run=true" >> $GITHUB_OUTPUT
@@ -58,6 +73,16 @@ jobs:
         with:
           node-version: '24'
 
+      # ⭐ استرجاع جلسة البوت
+      - name: Restore bot session
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .sessions/bot-${{ matrix.bot_id }}
+          key: session-bot-${{ matrix.bot_id }}-${{ github.run_id }}
+          restore-keys: |
+            session-bot-${{ matrix.bot_id }}-
+
       - name: Install packages
         if: steps.gate.outputs.run == 'true'
         run: npm install
@@ -69,7 +94,7 @@ jobs:
       - name: Random jitter
         if: steps.gate.outputs.run == 'true'
         run: |
-          JITTER=$(( (RANDOM + ${{ matrix.bot_id }} * 41) % 120 ))
+          JITTER=$(( (RANDOM + ${{ matrix.bot_id }} * 43) % 120 ))
           echo "Bot ${{ matrix.bot_id }} → sleep ${JITTER}s"
           sleep $JITTER
 
@@ -85,6 +110,16 @@ jobs:
           HEADLESS: 'true'
           SCREENSHOTS: 'false'
           GEO_STRICT: 'true'
+          ADBLOCKER_RATE: '0.25'
+          RETURNING_RATE: '0.30'
           STATE_DIR: '.bot-state-${{ matrix.bot_id }}'
           GEO_CACHE_DIR: '.geo-cache-${{ matrix.bot_id }}'
         run: npm test
+
+      # ⭐ حفظ جلسة البوت
+      - name: Save bot session
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sessions/bot-${{ matrix.bot_id }}
+          key: session-bot-${{ matrix.bot_id }}-${{ github.run_id }}
