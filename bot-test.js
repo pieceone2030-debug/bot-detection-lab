@@ -1,12 +1,10 @@
 /**
- * Bot Detection Lab v3.3 — Randomized Timing Edition
+ * Bot Detection Lab v3.4 — Persistent Sessions + Ad-Blocker
  * ─────────────────────────────────────────────────────────────
- * Fixes in v3.3 (based on AI analysis feedback):
- *   • Removed fixed 10s pattern (dwell times now 3-50s)
- *   • Homepage thinking time now varies 2-15s
- *   • Expanded target articles (all cards, not just first 6)
- *   • Added 3 more US timezones (Detroit, Indianapolis, Boise)
- * ─────────────────────────────────────────────────────────────
+ * • 25% of bots use ad-blocker (realistic distribution)
+ * • 30% of bots are returning visitors (persistent sessions)
+ * • 70% are fresh visitors (clean session)
+ * • Full Blogger logic preserved (find cards → click post → read → exit)
  */
 'use strict';
 
@@ -17,6 +15,7 @@ const crypto = require("crypto");
 const { addExtra } = require("playwright-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const AnonymizeUA = require("@zorilla/puppeteer-extra-plugin-anonymize-ua").default;
+const { PlaywrightBlocker } = require("@ghostery/adblocker-playwright");
 
 const chromiumExtra = addExtra(chromium);
 chromiumExtra.use(StealthPlugin());
@@ -45,6 +44,8 @@ const CFG = {
     cronMinGapMin:    intEnv("CRON_MIN_GAP_MINUTES", 20),
     geoStrict:        envBool("GEO_STRICT",         true),
     geoCacheDir:      process.env.GEO_CACHE_DIR     || ".geo-cache",
+    adBlockerRate:    parseFloat(process.env.ADBLOCKER_RATE || "0.25"),   // ≤25%
+    returningRate:    parseFloat(process.env.RETURNING_RATE || "0.30")    // ≤35%
 };
 
 function intEnv(k, d) {
@@ -172,7 +173,7 @@ const BASE_FINGERPRINTS = [
 ];
 
 /* ═══════════════════════════════════════════════════════════════
-   🌍  Geo Profiles — MODIFICATION 4: Added 3 more US timezones
+   🌍  Geo Profiles
    ═══════════════════════════════════════════════════════════════ */
 
 const GEO_PROFILES = {
@@ -180,14 +181,9 @@ const GEO_PROFILES = {
         locale: 'en-US',
         languages: ['en-US', 'en'],
         timezones: [
-            'America/New_York',
-            'America/Chicago',
-            'America/Denver',
-            'America/Los_Angeles',
-            'America/Phoenix',
-            'America/Detroit',
-            'America/Indiana/Indianapolis',
-            'America/Boise'
+            'America/New_York', 'America/Chicago', 'America/Denver',
+            'America/Los_Angeles', 'America/Phoenix',
+            'America/Detroit', 'America/Indiana/Indianapolis', 'America/Boise'
         ]
     },
     'CA': { locale: 'en-CA', languages: ['en-CA', 'en', 'fr'], timezones: ['America/Toronto', 'America/Vancouver'] },
@@ -219,7 +215,6 @@ const GEO_PROFILES = {
     'UA': { locale: 'uk-UA', languages: ['uk-UA', 'uk', 'ru', 'en'], timezones: ['Europe/Kiev'] }
 };
 
-/* MODIFICATION 4b: Added offsets for new timezones */
 const TZ_OFFSETS = {
     'America/New_York': 300, 'America/Chicago': 360, 'America/Denver': 420,
     'America/Phoenix': 420, 'America/Los_Angeles': 480, 'America/Toronto': 300,
@@ -383,7 +378,6 @@ async function detectGeo(proxy) {
                 });
                 if (!raw || !raw.ip) continue;
 
-                // Reset before each API
                 ip = raw.ip;
                 country = null;
                 timezone = null;
@@ -391,7 +385,6 @@ async function detectGeo(proxy) {
                 org = null;
                 asn = null;
 
-                // ipapi.co
                 if (raw.country_code !== undefined && typeof raw.timezone === 'string') {
                     country = (raw.country_code || '').toUpperCase();
                     timezone = raw.timezone;
@@ -400,20 +393,16 @@ async function detectGeo(proxy) {
                     asn = raw.asn;
                     source = 'ipapi';
                 }
-                // ipwho.is (timezone is an object)
                 else if (raw.success === true) {
                     country = (raw.country_code || '').toUpperCase();
                     if (raw.timezone) {
-                        timezone = typeof raw.timezone === 'string'
-                            ? raw.timezone
-                            : raw.timezone.id || null;
+                        timezone = typeof raw.timezone === 'string' ? raw.timezone : raw.timezone.id || null;
                     }
                     city = raw.city;
                     org = raw.connection && raw.connection.org;
                     asn = raw.connection && raw.connection.asn;
                     source = 'ipwho';
                 }
-                // ipinfo.io
                 else if (raw.country !== undefined && raw.country.length === 2) {
                     country = (raw.country || '').toUpperCase();
                     timezone = typeof raw.timezone === 'string' ? raw.timezone : null;
@@ -421,7 +410,6 @@ async function detectGeo(proxy) {
                     org = raw.org;
                     source = 'ipinfo';
                 }
-                // ifconfig.co
                 else if (raw.country_iso !== undefined) {
                     country = (raw.country_iso || '').toUpperCase();
                     timezone = typeof raw.time_zone === 'string' ? raw.time_zone : null;
@@ -429,19 +417,16 @@ async function detectGeo(proxy) {
                     source = 'ifconfig';
                 }
 
-                // Normalize timezone
                 if (timezone && typeof timezone === 'object') {
                     timezone = timezone.id || timezone.name || null;
                 }
 
-                // Must have country + timezone
                 if (!country || !timezone) {
                     LOG.warn('GEO', `${source} returned no timezone — trying next API`);
                     ip = null; country = null; timezone = null;
                     continue;
                 }
 
-                // Validate timezone
                 if (TZ_OFFSETS[timezone] === undefined) {
                     LOG.warn('GEO', `${source} returned unknown timezone "${timezone}" — trying next API`);
                     ip = null; country = null; timezone = null;
@@ -459,16 +444,7 @@ async function detectGeo(proxy) {
             return null;
         }
 
-        const geo = {
-            ip,
-            country,
-            country_name: country,
-            timezone,
-            city,
-            org,
-            asn,
-            source
-        };
+        const geo = { ip, country, country_name: country, timezone, city, org, asn, source };
         LOG.ok('GEO', `${city || '?'}, ${country} (${ip}) | TZ: ${timezone} | via ${source}`);
         saveGeocache(proxy, geo);
         return geo;
@@ -499,12 +475,10 @@ function buildFingerprintForGeo(baseFp, geo, options = {}) {
     const fp = JSON.parse(JSON.stringify(baseFp));
     const profile = pickGeoProfile(geo.country);
 
-    // HARD LOCK: timezone from IP
     fp.timezone = geo.timezone;
     fp.locale = profile.locale;
     fp.languages = [...profile.languages];
 
-    // Subtle per-bot variations
     const v = rng();
     if (v < 0.30) {
         fp.viewport.width  = Math.round(fp.viewport.width  * 0.92);
@@ -557,25 +531,25 @@ function buildStealthScript(fp) {
         defProp(navProto, 'webdriver', () => undefined);
 
         try {
-            const mkMime = (type, suffixes, desc) => {
+            const mkMime = (t, s, d) => {
                 const m = Object.create(MimeType.prototype);
-                Object.defineProperty(m, 'type', { value: type });
-                Object.defineProperty(m, 'suffixes', { value: suffixes });
-                Object.defineProperty(m, 'description', { value: desc });
+                Object.defineProperty(m, 'type', { value: t });
+                Object.defineProperty(m, 'suffixes', { value: s });
+                Object.defineProperty(m, 'description', { value: d });
                 Object.defineProperty(m, 'enabledPlugin', { value: null });
                 return m;
             };
-            const mkPlugin = (name, file, desc, mimes) => {
+            const mkPlugin = (n, f, d, ms) => {
                 const p = Object.create(Plugin.prototype);
-                Object.defineProperty(p, 'name', { value: name });
-                Object.defineProperty(p, 'filename', { value: file });
-                Object.defineProperty(p, 'description', { value: desc });
-                Object.defineProperty(p, 'length', { value: mimes.length });
-                mimes.forEach((m, i) => Object.defineProperty(p, i, { value: m }));
+                Object.defineProperty(p, 'name', { value: n });
+                Object.defineProperty(p, 'filename', { value: f });
+                Object.defineProperty(p, 'description', { value: d });
+                Object.defineProperty(p, 'length', { value: ms.length });
+                ms.forEach((m, i) => Object.defineProperty(p, i, { value: m }));
                 return p;
             };
-            const pdf1 = mkMime('application/pdf', 'pdf', 'Portable Document Format');
-            const pdf2 = mkMime('text/pdf', 'pdf', 'Portable Document Format');
+            const pdf1 = mkMime('application/pdf', 'pdf', 'PDF');
+            const pdf2 = mkMime('text/pdf', 'pdf', 'PDF');
             const plugins = [
                 mkPlugin('PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
                 mkPlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'PDF', [pdf1, pdf2]),
@@ -606,62 +580,27 @@ function buildStealthScript(fp) {
             const patchCtx = (ctx) => {
                 if (!ctx) return ctx;
                 try {
-                    const origGetParam = ctx.getParameter.bind(ctx);
+                    const gp = ctx.getParameter.bind(ctx);
                     Object.defineProperty(ctx, 'getParameter', {
                         value: function (p) {
                             if (p === 37445) return FP.gpuVendor;
                             if (p === 37446) return FP.gpuRenderer;
                             if (p === 7936) return 'WebKit';
                             if (p === 7937) return 'WebKit WebGL';
-                            return origGetParam(p);
+                            return gp(p);
                         },
                         writable: false, configurable: false
                     });
                 } catch (e) {}
                 return ctx;
             };
-            const origGetContext = HTMLCanvasElement.prototype.getContext;
+            const origGC = HTMLCanvasElement.prototype.getContext;
             HTMLCanvasElement.prototype.getContext = function (type, attrs) {
-                const ctx = origGetContext.call(this, type, attrs);
+                const ctx = origGC.call(this, type, attrs);
                 if (ctx && (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2')) {
                     return patchCtx(ctx);
                 }
                 return ctx;
-            };
-            if (window.WebGLRenderingContext) {
-                const gp = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function (p) {
-                    if (p === 37445) return FP.gpuVendor;
-                    if (p === 37446) return FP.gpuRenderer;
-                    if (p === 7936) return 'WebKit';
-                    if (p === 7937) return 'WebKit WebGL';
-                    return gp.call(this, p);
-                };
-            }
-            if (window.WebGL2RenderingContext) {
-                const gp2 = WebGL2RenderingContext.prototype.getParameter;
-                WebGL2RenderingContext.prototype.getParameter = function (p) {
-                    if (p === 37445) return FP.gpuVendor;
-                    if (p === 37446) return FP.gpuRenderer;
-                    if (p === 7936) return 'WebKit';
-                    if (p === 7937) return 'WebKit WebGL';
-                    return gp2.call(this, p);
-                };
-            }
-        } catch (e) {}
-
-        try {
-            const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-            CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
-                const imgData = origGetImageData.call(this, x, y, w, h);
-                const data = imgData.data;
-                const pixelCount = data.length / 4;
-                const noiseCount = Math.max(1, Math.floor(pixelCount * 0.0001));
-                for (let i = 0; i < noiseCount; i++) {
-                    const idx = Math.floor(Math.random() * pixelCount) * 4;
-                    data[idx] = (data[idx] + 1) % 256;
-                }
-                return imgData;
             };
         } catch (e) {}
 
@@ -690,7 +629,11 @@ function buildStealthScript(fp) {
             window.chrome.runtime = window.chrome.runtime || {};
             window.chrome.app = window.chrome.app || { isInstalled: false };
             window.chrome.csi = () => ({ onloadT: Date.now(), startE: Date.now(), pageT: 0, tran: 15 });
-            window.chrome.loadTimes = () => ({ commitLoadTime: Date.now()/1000, finishLoadTime: Date.now()/1000, navigationType: 'Other' });
+            window.chrome.loadTimes = () => ({
+                commitLoadTime: Date.now()/1000,
+                finishLoadTime: Date.now()/1000,
+                navigationType: 'Other'
+            });
         } catch (e) {}
 
         try {
@@ -699,16 +642,6 @@ function buildStealthScript(fp) {
                 if (cfg && cfg.iceServers) cfg.iceServers = [];
                 return new oRTC(cfg || { iceServers: [] });
             };
-        } catch (e) {}
-
-        try {
-            if (navigator.getBattery) {
-                navigator.getBattery = () => Promise.resolve({
-                    charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1,
-                    onchargingchange: null, onchargingtimechange: null,
-                    ondischargingtimechange: null, onlevelchange: null
-                });
-            }
         } catch (e) {}
     })();
     `;
@@ -937,7 +870,7 @@ async function exitToGame(page, B, log) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   🎬  Session Runner — MODIFICATIONS 1, 2, 3 applied
+   🎬  Session Runner — v3.4 (Persistent + Ad-Blocker)
    ═══════════════════════════════════════════════════════════════ */
 
 async function runOneBot(botId, fingerprint, options = {}) {
@@ -949,17 +882,32 @@ async function runOneBot(botId, fingerprint, options = {}) {
 
     const refSrc = referrerSource || pickReferrerSource();
 
+    // ⭐ قرارات عشوائية
+    const useAdBlocker = rng() < CFG.adBlockerRate;
+    const isReturning  = rng() < CFG.returningRate;
+
     log(`Fingerprint: ${fingerprint.name}`);
     log(`  UA: ${fingerprint.userAgent.substring(0, 70)}...`);
     log(`  TZ: ${fingerprint.timezone} | Locale: ${fingerprint.locale}`);
     log(`  Arrival: ${refSrc.name}${refSrc.referer ? ` (${refSrc.referer})` : ' (direct)'}`);
+    log(`  Ad-Blocker: ${useAdBlocker ? '✅ ENABLED' : '❌ disabled'}`);
+    log(`  Visitor: ${isReturning ? '🔁 RETURNING' : '🆕 NEW'}`);
     if (proxy) log(`  Proxy: ${proxy.server} → ${proxyGeo ? proxyGeo.city + ', ' + proxyGeo.country : '?'}`);
 
     const B = makeBehaviorEngine(log);
     const startTime = Date.now();
 
-    let browser, context, page;
+    let context, page;
+    const sessionPath = path.join(process.cwd(), '.sessions', `bot-${botId}`);
+
     try {
+        // ⭐ إدارة الجلسة الدائمة
+        if (!isReturning) {
+            try { fs.rmSync(sessionPath, { recursive: true, force: true }); } catch (e) {}
+        }
+        fs.mkdirSync(sessionPath, { recursive: true });
+
+        // ⭐ إعدادات الإطلاق
         const launchArgs = [
             `--user-agent=${fingerprint.userAgent}`,
             `--lang=${fingerprint.languages[0]}`,
@@ -967,14 +915,16 @@ async function runOneBot(botId, fingerprint, options = {}) {
             '--no-sandbox', '--disable-setuid-sandbox',
             '--disable-dev-shm-usage', '--no-first-run', '--no-zygote'
         ];
+
         const proxyConfig = proxy ? {
             server: `http://${proxy.server}`,
             username: proxy.username,
             password: proxy.password
         } : undefined;
 
-        browser = await chromiumExtra.launch({ headless: CFG.headless, args: launchArgs, proxy: proxyConfig });
-        context = await browser.newContext({
+        // ⭐ استخدام launchPersistentContext
+        context = await chromiumExtra.launchPersistentContext(sessionPath, {
+            headless: CFG.headless,
             viewport: fingerprint.viewport,
             screen: { width: fingerprint.screen.width, height: fingerprint.screen.height },
             userAgent: fingerprint.userAgent,
@@ -982,29 +932,49 @@ async function runOneBot(botId, fingerprint, options = {}) {
             timezoneId: fingerprint.timezone,
             deviceScaleFactor: fingerprint.dsf,
             colorScheme: 'light',
+            args: launchArgs,
             proxy: proxyConfig
         });
 
+        // ⭐ تفعيل Ad-Blocker (25% فقط)
+        if (useAdBlocker) {
+            try {
+                log(`  Loading ad-blocker...`);
+                const blocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch);
+                await blocker.enableBlockingInContext(context);
+                log(`  Ad-blocker ready`);
+            } catch (e) {
+                log(`  Ad-blocker failed: ${e.message}`);
+            }
+        }
+
+        // ⭐ حقن Stealth Script
         await context.addInitScript(buildStealthScript(fingerprint));
-        page = await context.newPage();
+
+        // ⭐ الحصول على الصفحة
+        page = context.pages()[0];
+        if (!page) page = await context.newPage();
         await page.addInitScript(buildStealthScript(fingerprint));
 
         page.on("framenavigated", f => {
             if (f === page.mainFrame()) log(`  [NAV] ${f.url().substring(0, 80)}`);
         });
 
+        // ⭐ التنقل
         const gotoOpts = { waitUntil: "domcontentloaded", timeout: 60000 };
         if (refSrc.referer) gotoOpts.referer = refSrc.referer;
 
         await page.goto(CFG.targetUrl, gotoOpts);
-        log(`Loaded homepage via ${refSrc.name}`);
+        log(`  Loaded homepage via ${refSrc.name}`);
 
+        // ⭐ التحقق
         const liveFp = await page.evaluate(() => ({
             wd: navigator.webdriver,
             plugins: navigator.plugins.length,
             cores: navigator.hardwareConcurrency,
             tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
             ref: document.referrer,
+            cookieLen: document.cookie.length,
             gpu: (() => {
                 try {
                     const c = document.createElement('canvas');
@@ -1015,9 +985,10 @@ async function runOneBot(botId, fingerprint, options = {}) {
                 } catch (e) { return '?'; }
             })()
         }));
-        log(`  CHECK: wd=${liveFp.wd}, plugins=${liveFp.plugins}, tz=${liveFp.tz}`);
+        log(`  CHECK: wd=${liveFp.wd}, plugins=${liveFp.plugins}, tz=${liveFp.tz}, cookieLen=${liveFp.cookieLen}`);
         log(`  GPU: ${liveFp.gpu}`);
 
+        // ⭐ نوع الجلسة
         const sessionType = (() => {
             const r = rng();
             if (r < 0.25) return 'bounce';
@@ -1026,13 +997,13 @@ async function runOneBot(botId, fingerprint, options = {}) {
         })();
         log(`  Session type: ${sessionType}`);
 
-        // ⭐ MODIFICATION 3: Homepage thinking time (2-15s)
-        const homeThink = randInt(2000, 15000);
+        // ⭐ وقت التفكير (أقصر للعائدين)
+        const homeThink = isReturning ? randInt(1000, 5000) : randInt(2000, 15000);
         log(`  Thinking on homepage for ${(homeThink / 1000).toFixed(1)}s...`);
         await B.microMoves(page, randInt(1, 4));
         await page.waitForTimeout(homeThink);
 
-        // Light scroll activity
+        // ⭐ التمرير
         await B.scrollDown(page, randInt(
             sessionType === 'bounce' ? 100 : 200,
             sessionType === 'engaged' ? 600 : 380
@@ -1059,7 +1030,6 @@ async function runOneBot(botId, fingerprint, options = {}) {
         }
         log(`  Plan: ${plan}`);
 
-        // ⭐ MODIFICATION 1: Pick from ALL cards (not just first 6)
         const firstIdx = randInt(0, cards.length - 1);
         const first = cards[firstIdx];
         const ok1 = await clickGame(page, first.href, B, log);
@@ -1071,15 +1041,14 @@ async function runOneBot(botId, fingerprint, options = {}) {
             }
         }
 
-        // ⭐ MODIFICATION 2: More varied dwell times
         if (/\/\d{4}\/\d{2}\//.test(page.url())) {
             let dwellSec;
             if (sessionType === 'bounce') {
-                dwellSec = randInt(3, 10);          // 3-10s (quick bounce)
+                dwellSec = randInt(3, 10);
             } else if (sessionType === 'engaged') {
-                dwellSec = randInt(25, 50);         // 25-50s (long reader)
+                dwellSec = randInt(25, 50);
             } else {
-                dwellSec = randInt(8, 22);          // 8-22s (normal reader)
+                dwellSec = randInt(8, 22);
             }
             log(`  Dwell target: ${dwellSec}s (type: ${sessionType})`);
 
@@ -1098,7 +1067,6 @@ async function runOneBot(botId, fingerprint, options = {}) {
             }
         }
 
-        // Second game for 'double' plan
         if (plan === 'double' && page.url().includes('blogspot.com') && !/\/\d{4}\/\d{2}\//.test(page.url())) {
             await B.pause(page, 500, 1200);
             await B.scrollDown(page, randInt(150, 320));
@@ -1117,7 +1085,7 @@ async function runOneBot(botId, fingerprint, options = {}) {
         }
 
         const duration = Date.now() - startTime;
-        ok(`Session done in ${Math.round(duration / 1000)}s | type: ${sessionType} | source: ${refSrc.name}`);
+        ok(`Session done in ${Math.round(duration / 1000)}s | type: ${sessionType} | source: ${refSrc.name} | adblock: ${useAdBlocker} | visitor: ${isReturning ? 'returning' : 'new'}`);
 
         if (CFG.screenshots) {
             const dir = path.join(process.cwd(), "screenshots");
@@ -1129,13 +1097,13 @@ async function runOneBot(botId, fingerprint, options = {}) {
         }
 
         await B.pause(page, 1500, 2500);
-        return { status: 'ok', duration, sessionType, source: refSrc.name };
+        return { status: 'ok', duration, sessionType, source: refSrc.name, adblock: useAdBlocker, returning: isReturning };
 
     } catch (e) {
         err(`Session error: ${e.message}`);
         return { status: 'error', error: e.message, duration: Date.now() - startTime };
     } finally {
-        if (browser) await browser.close().catch(() => {});
+        if (context) await context.close().catch(() => {});
     }
 }
 
@@ -1428,7 +1396,7 @@ async function runAuto() {
 
 function printBanner() {
     console.log("╔══════════════════════════════════════════════════════╗");
-    console.log("║  BLOGGER BOT DETECTION LAB v3.3 — Randomized        ║");
+    console.log("║  BLOGGER BOT DETECTION LAB v3.4 — Persistent+AB    ║");
     console.log("╚══════════════════════════════════════════════════════╝");
     console.log(`  Run ID:        ${RUN_ID}`);
     console.log(`  Target:        ${CFG.targetUrl}`);
@@ -1437,9 +1405,10 @@ function printBanner() {
     console.log(`  Parallelism:   ${CFG.parallelism}`);
     console.log(`  Window:        ${CFG.windowMinutes} min`);
     console.log(`  Geo strict:    ${CFG.geoStrict}`);
+    console.log(`  Ad-Blocker:    ${(CFG.adBlockerRate * 100).toFixed(0)}%`);
+    console.log(`  Returning:     ${(CFG.returningRate * 100).toFixed(0)}%`);
     console.log(`  Max per IP:    ${CFG.maxPerIp}`);
     console.log(`  Max duration:  ${CFG.maxDurationMin} min`);
-    console.log(`  Headless:      ${CFG.headless}`);
     console.log("──────────────────────────────────────────────────────");
 }
 
